@@ -3,6 +3,9 @@ name = "LogScope"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "log_scope"
+
 [dependencies]
 anyhow = "1.0.102"
 chrono = { version = "0.4.45", features = ["serde"] }
