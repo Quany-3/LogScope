@@ -1,0 +1,2 @@
+{"timestamp":"2026-06-12T10:00:00Z","level":"INFO","source":"api","message":"service started"}
+{"timestamp":"2026-06-12T10:02:00Z","level":"ERROR","source":"worker","message":"database timeout"}
