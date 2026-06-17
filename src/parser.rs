@@ -2,6 +2,7 @@ pub const MODULE_NAME: &str = "parser";
 
 use crate::model::{LogEntry, LogLevel, LogSource, LogTimestamp};
 use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use thiserror::Error;
 
 pub type ParseResult<T> = Result<T, ParseError>;
@@ -45,6 +46,40 @@ impl LogParser for PlainTextLogParser {
     }
 }
 
+/// Parser for one JSON object per line with timestamp, level, source, and message fields.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct JsonLineLogParser;
+
+impl LogParser for JsonLineLogParser {
+    fn parse_line(&self, line: &str) -> ParseResult<LogEntry> {
+        let parsed: JsonLogLine =
+            serde_json::from_str(line).map_err(|_| ParseError::InvalidJson {
+                line: line.to_string(),
+            })?;
+
+        let timestamp = required_field(parsed.timestamp, "timestamp")?;
+        let level = required_field(parsed.level, "level")?;
+        let source = required_field(parsed.source, "source")?;
+        let message = required_field(parsed.message, "message")?;
+
+        Ok(LogEntry {
+            timestamp: LogTimestamp::new(parse_timestamp(&timestamp)?),
+            level: parse_level(&level)?,
+            source: LogSource::new(source),
+            message,
+            raw: line.to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonLogLine {
+    timestamp: Option<String>,
+    level: Option<String>,
+    source: Option<String>,
+    message: Option<String>,
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ParseError {
     #[error("invalid log line format: {line}")]
@@ -53,6 +88,10 @@ pub enum ParseError {
     InvalidTimestamp { value: String },
     #[error("invalid log level: {value}")]
     InvalidLevel { value: String },
+    #[error("invalid json log line: {line}")]
+    InvalidJson { line: String },
+    #[error("missing required field: {field}")]
+    MissingField { field: &'static str },
 }
 
 impl ParseError {
@@ -85,9 +124,15 @@ fn parse_level(value: &str) -> ParseResult<LogLevel> {
     }
 }
 
+fn required_field(value: Option<String>, field: &'static str) -> ParseResult<String> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(ParseError::MissingField { field })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LogParser, ParseError, PlainTextLogParser};
+    use super::{JsonLineLogParser, LogParser, ParseError, PlainTextLogParser};
     use crate::model::LogLevel;
     use chrono::{TimeZone, Utc};
 
@@ -134,5 +179,33 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ParseError::InvalidLevel { .. }));
+    }
+
+    #[test]
+    fn parses_json_line_log() {
+        let parser = JsonLineLogParser;
+        let entry = parser
+            .parse_line(
+                r#"{"timestamp":"2026-06-12T10:02:00Z","level":"ERROR","source":"worker","message":"database timeout"}"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            entry.timestamp.value,
+            Utc.with_ymd_and_hms(2026, 6, 12, 10, 2, 0).unwrap()
+        );
+        assert_eq!(entry.level, LogLevel::Error);
+        assert_eq!(entry.source.name, "worker");
+        assert_eq!(entry.message, "database timeout");
+    }
+
+    #[test]
+    fn rejects_json_line_with_missing_field() {
+        let parser = JsonLineLogParser;
+        let error = parser
+            .parse_line(r#"{"timestamp":"2026-06-12T10:02:00Z","level":"ERROR","source":"worker"}"#)
+            .unwrap_err();
+
+        assert!(matches!(error, ParseError::MissingField { field } if field == "message"));
     }
 }
