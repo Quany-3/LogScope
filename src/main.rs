@@ -1,3 +1,3 @@
-fn main() {
-    println!("Hello, world!");
+fn main() -> anyhow::Result<()> {
+    log_scope::cli::run()
 }
