@@ -25,7 +25,8 @@ impl AnalysisResult {
 #[cfg(test)]
 mod tests {
     use super::AnalysisResult;
-    use crate::model::LogLevel;
+    use crate::model::{LogEntry, LogLevel, LogSource, LogTimestamp};
+    use chrono::{TimeZone, Utc};
 
     #[test]
     fn defines_analysis_result_models() {
@@ -37,5 +38,43 @@ mod tests {
         assert_eq!(result.total_count, 3);
         assert_eq!(result.level_counts[&LogLevel::Info], 2);
         assert_eq!(result.source_counts["api"], 2);
+    }
+
+    #[test]
+    fn provides_mock_log_entries_for_analyzer_tests() {
+        let entries = mock_log_entries();
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].level, LogLevel::Info);
+        assert_eq!(entries[1].level, LogLevel::Warn);
+        assert_eq!(entries[2].level, LogLevel::Error);
+        assert_eq!(entries[2].source.name, "api");
+    }
+
+    /// Shared sample entries for analyzer unit tests.
+    fn mock_log_entries() -> Vec<LogEntry> {
+        vec![
+            LogEntry {
+                timestamp: LogTimestamp::new(Utc.with_ymd_and_hms(2026, 6, 12, 10, 0, 0).unwrap()),
+                level: LogLevel::Info,
+                source: LogSource::new("api"),
+                message: "request completed".to_string(),
+                raw: "2026-06-12T10:00:00Z INFO api request completed".to_string(),
+            },
+            LogEntry {
+                timestamp: LogTimestamp::new(Utc.with_ymd_and_hms(2026, 6, 12, 10, 1, 0).unwrap()),
+                level: LogLevel::Warn,
+                source: LogSource::new("worker"),
+                message: "retrying failed job".to_string(),
+                raw: "2026-06-12T10:01:00Z WARN worker retrying failed job".to_string(),
+            },
+            LogEntry {
+                timestamp: LogTimestamp::new(Utc.with_ymd_and_hms(2026, 6, 12, 10, 2, 0).unwrap()),
+                level: LogLevel::Error,
+                source: LogSource::new("api"),
+                message: "database timeout".to_string(),
+                raw: "2026-06-12T10:02:00Z ERROR api database timeout".to_string(),
+            },
+        ]
     }
 }
