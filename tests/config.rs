@@ -26,6 +26,18 @@ fn loads_text_parser_config() {
     assert_eq!(config.parser, ParserFormat::Text);
 }
 
+#[test]
+fn rejects_invalid_toml_config() {
+    let path = temp_config_path();
+    fs::write(&path, "input = [not valid toml").unwrap();
+
+    let error = LogScopeConfig::load_from_file(&path).unwrap_err();
+
+    fs::remove_file(path).unwrap();
+    assert!(error.to_string().contains("failed to parse config file"));
+}
+
+// A unique path keeps concurrently running tests from sharing state.
 fn temp_config_path() -> std::path::PathBuf {
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
