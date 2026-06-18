@@ -1,6 +1,6 @@
 pub const MODULE_NAME: &str = "analyzer";
 
-use crate::model::LogLevel;
+use crate::model::{LogEntry, LogLevel};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -22,9 +22,33 @@ impl AnalysisResult {
     }
 }
 
+/// Interface implemented by services that aggregate parsed log entries.
+pub trait AnalysisService {
+    fn analyze(&self, entries: &[LogEntry]) -> AnalysisResult;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BasicAnalyzer;
+
+impl AnalysisService for BasicAnalyzer {
+    fn analyze(&self, entries: &[LogEntry]) -> AnalysisResult {
+        let mut result = AnalysisResult::new(entries.len());
+
+        for entry in entries {
+            *result.level_counts.entry(entry.level).or_insert(0) += 1;
+            *result
+                .source_counts
+                .entry(entry.source.name.clone())
+                .or_insert(0) += 1;
+        }
+
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::AnalysisResult;
+    use super::{AnalysisResult, AnalysisService, BasicAnalyzer};
     use crate::model::{LogEntry, LogLevel, LogSource, LogTimestamp};
     use chrono::{TimeZone, Utc};
 
@@ -49,6 +73,25 @@ mod tests {
         assert_eq!(entries[1].level, LogLevel::Warn);
         assert_eq!(entries[2].level, LogLevel::Error);
         assert_eq!(entries[2].source.name, "api");
+    }
+
+    #[test]
+    fn analyzes_total_level_and_source_statistics() {
+        let result = BasicAnalyzer.analyze(&mock_log_entries());
+
+        assert_eq!(result.total_count, 3);
+        assert_eq!(result.level_counts[&LogLevel::Info], 1);
+        assert_eq!(result.level_counts[&LogLevel::Warn], 1);
+        assert_eq!(result.level_counts[&LogLevel::Error], 1);
+        assert_eq!(result.source_counts["api"], 2);
+        assert_eq!(result.source_counts["worker"], 1);
+    }
+
+    #[test]
+    fn analyzes_empty_log_collection() {
+        let result = BasicAnalyzer.analyze(&[]);
+
+        assert_eq!(result, AnalysisResult::new(0));
     }
 
     /// Shared sample entries for analyzer unit tests.

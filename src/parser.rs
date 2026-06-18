@@ -111,17 +111,9 @@ fn parse_timestamp(value: &str) -> ParseResult<DateTime<Utc>> {
 }
 
 fn parse_level(value: &str) -> ParseResult<LogLevel> {
-    match value.to_ascii_uppercase().as_str() {
-        "TRACE" => Ok(LogLevel::Trace),
-        "DEBUG" => Ok(LogLevel::Debug),
-        "INFO" => Ok(LogLevel::Info),
-        "WARN" | "WARNING" => Ok(LogLevel::Warn),
-        "ERROR" => Ok(LogLevel::Error),
-        "FATAL" => Ok(LogLevel::Fatal),
-        _ => Err(ParseError::InvalidLevel {
-            value: value.to_string(),
-        }),
-    }
+    LogLevel::from_label(value).ok_or_else(|| ParseError::InvalidLevel {
+        value: value.to_string(),
+    })
 }
 
 fn required_field(value: Option<String>, field: &'static str) -> ParseResult<String> {
@@ -207,5 +199,20 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ParseError::MissingField { field } if field == "message"));
+    }
+
+    #[test]
+    fn normalizes_parsed_log_levels() {
+        let text_entry = PlainTextLogParser
+            .parse_line("2026-06-12T10:02:00Z warning api retrying")
+            .unwrap();
+        let json_entry = JsonLineLogParser
+            .parse_line(
+                r#"{"timestamp":"2026-06-12T10:02:00Z","level":"error","source":"api","message":"failed"}"#,
+            )
+            .unwrap();
+
+        assert_eq!(text_entry.level, LogLevel::Warn);
+        assert_eq!(json_entry.level, LogLevel::Error);
     }
 }

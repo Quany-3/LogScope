@@ -1,9 +1,10 @@
 pub const MODULE_NAME: &str = "cli";
 
+use crate::analyzer::{AnalysisResult, AnalysisService, BasicAnalyzer};
 use crate::config::{LogScopeConfig, ParserFormat};
 use crate::parser::{JsonLineLogParser, LogParser, PlainTextLogParser};
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::fs;
 use std::path::PathBuf;
 
@@ -15,6 +16,18 @@ use std::path::PathBuf;
     about = "Analyze log files from the terminal"
 )]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum Command {
+    /// Parse a log file and print basic statistics.
+    Analyze(AnalyzeArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct AnalyzeArgs {
     /// Input log file to parse.
     #[arg(required_unless_present = "config")]
     pub input: Option<PathBuf>,
@@ -32,32 +45,64 @@ pub enum ParserKind {
     Json,
 }
 
-/// Parse the selected input file and return the number of accepted log entries.
-pub fn execute(cli: &Cli) -> Result<usize> {
-    let options = resolve_options(cli)?;
+/// Execute the requested command and return its analysis data.
+pub fn execute(cli: &Cli) -> Result<AnalysisResult> {
+    match &cli.command {
+        Command::Analyze(args) => execute_analyze(args),
+    }
+}
+
+fn execute_analyze(args: &AnalyzeArgs) -> Result<AnalysisResult> {
+    let options = resolve_options(args)?;
     let content = fs::read_to_string(&options.input)
         .with_context(|| format!("failed to read input file {}", options.input.display()))?;
 
     let parser = parser_for(options.parser);
-    let mut parsed_count = 0;
+    let mut entries = Vec::new();
     for (index, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        parser
+        let entry = parser
             .parse_line(line)
             .with_context(|| format!("failed to parse line {}", index + 1))?;
-        parsed_count += 1;
+        entries.push(entry);
     }
 
-    Ok(parsed_count)
+    Ok(BasicAnalyzer.analyze(&entries))
 }
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    let parsed_count = execute(&cli)?;
-    println!("parsed {parsed_count} log entries");
+    let result = execute(&cli)?;
+    println!("{}", format_analysis_summary(&result));
     Ok(())
+}
+
+/// Build deterministic text output for terminals and integration tests.
+pub fn format_analysis_summary(result: &AnalysisResult) -> String {
+    let mut summary = format!("Total entries: {}\nLevels:\n", result.total_count);
+    for level in [
+        crate::model::LogLevel::Trace,
+        crate::model::LogLevel::Debug,
+        crate::model::LogLevel::Info,
+        crate::model::LogLevel::Warn,
+        crate::model::LogLevel::Error,
+        crate::model::LogLevel::Fatal,
+    ] {
+        if let Some(count) = result.level_counts.get(&level) {
+            summary.push_str(&format!("  {}: {count}\n", level.as_str()));
+        }
+    }
+
+    summary.push_str("Sources:\n");
+    let mut sources = result.source_counts.iter().collect::<Vec<_>>();
+    sources.sort_by_key(|(source, _)| *source);
+    for (source, count) in sources {
+        summary.push_str(&format!("  {source}: {count}\n"));
+    }
+
+    summary.trim_end().to_string()
 }
 
 fn parser_for(parser: ParserKind) -> Box<dyn LogParser> {
@@ -74,19 +119,19 @@ struct RuntimeOptions {
 }
 
 /// Resolve effective options with explicit CLI values taking precedence.
-fn resolve_options(cli: &Cli) -> Result<RuntimeOptions> {
-    let config = cli
+fn resolve_options(args: &AnalyzeArgs) -> Result<RuntimeOptions> {
+    let config = args
         .config
         .as_ref()
         .map(LogScopeConfig::load_from_file)
         .transpose()?;
 
-    let input = cli
+    let input = args
         .input
         .clone()
         .or_else(|| config.as_ref().map(|config| PathBuf::from(&config.input)))
         .context("input file is required when no config file provides one")?;
-    let parser = cli
+    let parser = args
         .parser
         .or_else(|| config.as_ref().map(|config| config.parser.into()))
         .unwrap_or(ParserKind::Text);
@@ -105,7 +150,7 @@ impl From<ParserFormat> for ParserKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, ParserKind, execute};
+    use super::{AnalyzeArgs, Cli, Command, ParserKind, execute};
     use clap::Parser;
     use std::fs;
     use std::path::PathBuf;
@@ -113,46 +158,51 @@ mod tests {
 
     #[test]
     fn parses_input_file_argument() {
-        let cli = Cli::try_parse_from(["logscope", "logs/app.log"]).unwrap();
+        let cli = Cli::try_parse_from(["logscope", "analyze", "logs/app.log"]).unwrap();
 
-        assert_eq!(cli.input, Some(PathBuf::from("logs/app.log")));
+        assert_eq!(
+            analyze_args(&cli).input,
+            Some(PathBuf::from("logs/app.log"))
+        );
     }
 
     #[test]
     fn parses_parser_type_option() {
-        let cli = Cli::try_parse_from(["logscope", "--parser", "text", "logs/app.log"]).unwrap();
+        let cli = Cli::try_parse_from(["logscope", "analyze", "--parser", "text", "logs/app.log"])
+            .unwrap();
 
-        assert_eq!(cli.parser, Some(ParserKind::Text));
+        assert_eq!(analyze_args(&cli).parser, Some(ParserKind::Text));
     }
 
     #[test]
     fn parses_json_parser_type_option() {
-        let cli = Cli::try_parse_from(["logscope", "--parser", "json", "logs/app.json"]).unwrap();
+        let cli = Cli::try_parse_from(["logscope", "analyze", "--parser", "json", "logs/app.json"])
+            .unwrap();
 
-        assert_eq!(cli.parser, Some(ParserKind::Json));
+        assert_eq!(analyze_args(&cli).parser, Some(ParserKind::Json));
     }
 
     #[test]
     fn parses_config_file_option_without_input_argument() {
-        let cli = Cli::try_parse_from(["logscope", "--config", "logscope.toml"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["logscope", "analyze", "--config", "logscope.toml"]).unwrap();
 
-        assert_eq!(cli.config, Some(PathBuf::from("logscope.toml")));
-        assert_eq!(cli.input, None);
+        assert_eq!(
+            analyze_args(&cli).config,
+            Some(PathBuf::from("logscope.toml"))
+        );
+        assert_eq!(analyze_args(&cli).input, None);
     }
 
     #[test]
     fn connects_cli_input_with_plain_text_parser() {
         let path = write_temp_log("2026-06-12T10:00:00Z INFO api request completed\n");
-        let cli = Cli {
-            input: Some(path.clone()),
-            parser: Some(ParserKind::Text),
-            config: None,
-        };
+        let cli = analyze_cli(Some(path.clone()), Some(ParserKind::Text), None);
 
-        let parsed_count = execute(&cli).unwrap();
+        let result = execute(&cli).unwrap();
 
         fs::remove_file(path).unwrap();
-        assert_eq!(parsed_count, 1);
+        assert_eq!(result.total_count, 1);
     }
 
     #[test]
@@ -166,17 +216,13 @@ mod tests {
             "toml",
             &format!("input = \"{escaped_path}\"\nparser = \"json\"\n"),
         );
-        let cli = Cli {
-            input: None,
-            parser: None,
-            config: Some(config_path.clone()),
-        };
+        let cli = analyze_cli(None, None, Some(config_path.clone()));
 
-        let parsed_count = execute(&cli).unwrap();
+        let result = execute(&cli).unwrap();
 
         fs::remove_file(log_path).unwrap();
         fs::remove_file(config_path).unwrap();
-        assert_eq!(parsed_count, 1);
+        assert_eq!(result.total_count, 1);
     }
 
     #[test]
@@ -187,17 +233,36 @@ mod tests {
         );
         let config_path =
             write_temp_file("toml", "input = \"samples/plain.log\"\nparser = \"text\"\n");
-        let cli = Cli {
-            input: Some(json_path.clone()),
-            parser: Some(ParserKind::Json),
-            config: Some(config_path.clone()),
-        };
+        let cli = analyze_cli(
+            Some(json_path.clone()),
+            Some(ParserKind::Json),
+            Some(config_path.clone()),
+        );
 
-        let parsed_count = execute(&cli).unwrap();
+        let result = execute(&cli).unwrap();
 
         fs::remove_file(json_path).unwrap();
         fs::remove_file(config_path).unwrap();
-        assert_eq!(parsed_count, 1);
+        assert_eq!(result.total_count, 1);
+    }
+
+    fn analyze_args(cli: &Cli) -> &AnalyzeArgs {
+        let Command::Analyze(args) = &cli.command;
+        args
+    }
+
+    fn analyze_cli(
+        input: Option<PathBuf>,
+        parser: Option<ParserKind>,
+        config: Option<PathBuf>,
+    ) -> Cli {
+        Cli {
+            command: Command::Analyze(AnalyzeArgs {
+                input,
+                parser,
+                config,
+            }),
+        }
     }
 
     fn write_temp_log(content: &str) -> PathBuf {
