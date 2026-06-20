@@ -78,9 +78,50 @@ impl LogTimestamp {
     }
 }
 
+/// Optional constraints that can be combined by search and filter workflows.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilterCondition {
+    pub keyword: Option<String>,
+    pub level: Option<LogLevel>,
+    pub source: Option<String>,
+    pub start_time: Option<LogTimestamp>,
+    pub end_time: Option<LogTimestamp>,
+}
+
+impl FilterCondition {
+    pub fn is_empty(&self) -> bool {
+        self.keyword.is_none()
+            && self.level.is_none()
+            && self.source.is_none()
+            && self.start_time.is_none()
+            && self.end_time.is_none()
+    }
+}
+
+/// Search matches borrowing their original parsed log entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchResult<'a> {
+    pub entries: Vec<&'a LogEntry>,
+    pub total_matches: usize,
+}
+
+impl<'a> SearchResult<'a> {
+    pub fn new(entries: Vec<&'a LogEntry>) -> Self {
+        let total_matches = entries.len();
+        Self {
+            entries,
+            total_matches,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LogEntry, LogLevel, LogSource, LogTimestamp};
+    use super::{FilterCondition, LogEntry, LogLevel, LogSource, LogTimestamp, SearchResult};
     use chrono::{TimeZone, Utc};
 
     #[test]
@@ -132,5 +173,39 @@ mod tests {
         assert_eq!(LogLevel::Error.as_str(), "ERROR");
         assert!(LogLevel::Error.is_error());
         assert!(LogLevel::Info < LogLevel::Error);
+    }
+
+    #[test]
+    fn defines_filter_condition_model() {
+        let start = LogTimestamp::new(Utc.with_ymd_and_hms(2026, 6, 12, 10, 0, 0).unwrap());
+        let end = LogTimestamp::new(Utc.with_ymd_and_hms(2026, 6, 12, 11, 0, 0).unwrap());
+        let condition = FilterCondition {
+            keyword: Some("timeout".to_string()),
+            level: Some(LogLevel::Error),
+            source: Some("api".to_string()),
+            start_time: Some(start),
+            end_time: Some(end),
+        };
+
+        assert_eq!(condition.keyword.as_deref(), Some("timeout"));
+        assert_eq!(condition.level, Some(LogLevel::Error));
+        assert!(!condition.is_empty());
+        assert!(FilterCondition::default().is_empty());
+    }
+
+    #[test]
+    fn defines_borrowed_search_result_model() {
+        let entry = LogEntry {
+            timestamp: LogTimestamp::new(Utc.with_ymd_and_hms(2026, 6, 12, 10, 30, 0).unwrap()),
+            level: LogLevel::Error,
+            source: LogSource::new("api"),
+            message: "database timeout".to_string(),
+            raw: "2026-06-12T10:30:00Z ERROR api database timeout".to_string(),
+        };
+        let result = SearchResult::new(vec![&entry]);
+
+        assert_eq!(result.total_matches, 1);
+        assert_eq!(result.entries[0].message, "database timeout");
+        assert!(!result.is_empty());
     }
 }

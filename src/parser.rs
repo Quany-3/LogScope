@@ -215,4 +215,16 @@ mod tests {
         assert_eq!(text_entry.level, LogLevel::Warn);
         assert_eq!(json_entry.level, LogLevel::Error);
     }
+
+    #[test]
+    fn preserves_raw_line_for_all_parsers() {
+        let text = "2026-06-12T10:02:00Z ERROR api database timeout";
+        let json = r#"{"timestamp":"2026-06-12T10:02:00Z","level":"ERROR","source":"api","message":"database timeout"}"#;
+
+        let text_entry = PlainTextLogParser.parse_line(text).unwrap();
+        let json_entry = JsonLineLogParser.parse_line(json).unwrap();
+
+        assert_eq!(text_entry.raw, text);
+        assert_eq!(json_entry.raw, json);
+    }
 }
