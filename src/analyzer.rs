@@ -1,6 +1,7 @@
 pub const MODULE_NAME: &str = "analyzer";
 
 use crate::model::{LogEntry, LogLevel};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -29,6 +30,47 @@ pub trait AnalysisService {
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BasicAnalyzer;
+
+impl BasicAnalyzer {
+    /// Search the original log line without cloning matching entries.
+    pub fn search_keyword<'a>(&self, entries: &'a [LogEntry], keyword: &str) -> Vec<&'a LogEntry> {
+        let keyword = keyword.to_lowercase();
+        entries
+            .iter()
+            .filter(|entry| entry.raw.to_lowercase().contains(&keyword))
+            .collect()
+    }
+
+    pub fn filter_by_level<'a>(
+        &self,
+        entries: &'a [LogEntry],
+        level: LogLevel,
+    ) -> Vec<&'a LogEntry> {
+        entries
+            .iter()
+            .filter(|entry| entry.level == level)
+            .collect()
+    }
+
+    pub fn filter_by_source<'a>(&self, entries: &'a [LogEntry], source: &str) -> Vec<&'a LogEntry> {
+        entries
+            .iter()
+            .filter(|entry| entry.source.name == source)
+            .collect()
+    }
+
+    pub fn filter_by_time_range<'a>(
+        &self,
+        entries: &'a [LogEntry],
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Vec<&'a LogEntry> {
+        entries
+            .iter()
+            .filter(|entry| entry.timestamp.value >= start && entry.timestamp.value <= end)
+            .collect()
+    }
+}
 
 impl AnalysisService for BasicAnalyzer {
     fn analyze(&self, entries: &[LogEntry]) -> AnalysisResult {
@@ -92,6 +134,45 @@ mod tests {
         let result = BasicAnalyzer.analyze(&[]);
 
         assert_eq!(result, AnalysisResult::new(0));
+    }
+
+    #[test]
+    fn searches_entries_by_keyword_case_insensitively() {
+        let entries = mock_log_entries();
+        let matches = BasicAnalyzer.search_keyword(&entries, "FAILED");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].source.name, "worker");
+    }
+
+    #[test]
+    fn filters_entries_by_level() {
+        let entries = mock_log_entries();
+        let matches = BasicAnalyzer.filter_by_level(&entries, LogLevel::Error);
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].message, "database timeout");
+    }
+
+    #[test]
+    fn filters_entries_by_source() {
+        let entries = mock_log_entries();
+        let matches = BasicAnalyzer.filter_by_source(&entries, "api");
+
+        assert_eq!(matches.len(), 2);
+        assert!(matches.iter().all(|entry| entry.source.name == "api"));
+    }
+
+    #[test]
+    fn filters_entries_by_inclusive_time_range() {
+        let entries = mock_log_entries();
+        let start = Utc.with_ymd_and_hms(2026, 6, 12, 10, 1, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 6, 12, 10, 2, 0).unwrap();
+        let matches = BasicAnalyzer.filter_by_time_range(&entries, start, end);
+
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].level, LogLevel::Warn);
+        assert_eq!(matches[1].level, LogLevel::Error);
     }
 
     /// Shared sample entries for analyzer unit tests.
