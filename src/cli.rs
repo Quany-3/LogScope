@@ -2,8 +2,10 @@ pub const MODULE_NAME: &str = "cli";
 
 use crate::analyzer::{AnalysisResult, AnalysisService, BasicAnalyzer};
 use crate::config::{LogScopeConfig, ParserFormat};
+use crate::model::{FilterCondition, LogEntry, LogLevel, LogTimestamp, SearchResult};
 use crate::parser::{JsonLineLogParser, LogParser, PlainTextLogParser};
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::fs;
 use std::path::PathBuf;
@@ -24,6 +26,8 @@ pub struct Cli {
 pub enum Command {
     /// Parse a log file and print basic statistics.
     Analyze(AnalyzeArgs),
+    /// Search and filter parsed log entries.
+    Search(SearchArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -39,21 +43,95 @@ pub struct AnalyzeArgs {
     pub config: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct SearchArgs {
+    /// Input log file to search.
+    #[arg(required_unless_present = "config")]
+    pub input: Option<PathBuf>,
+    #[arg(long = "parser", value_enum)]
+    pub parser: Option<ParserKind>,
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    #[arg(long)]
+    pub keyword: Option<String>,
+    #[arg(long, value_parser = parse_log_level)]
+    pub level: Option<LogLevel>,
+    #[arg(long)]
+    pub source: Option<String>,
+    #[arg(long, value_parser = parse_utc_timestamp)]
+    pub start: Option<DateTime<Utc>>,
+    #[arg(long, value_parser = parse_utc_timestamp)]
+    pub end: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ParserKind {
     Text,
     Json,
 }
 
-/// Execute the requested command and return its analysis data.
-pub fn execute(cli: &Cli) -> Result<AnalysisResult> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandOutput {
+    Analysis(AnalysisResult),
+    Search(Vec<LogEntry>),
+}
+
+/// Execute the requested command and return structured output.
+pub fn execute(cli: &Cli) -> Result<CommandOutput> {
     match &cli.command {
-        Command::Analyze(args) => execute_analyze(args),
+        Command::Analyze(args) => execute_analyze(args).map(CommandOutput::Analysis),
+        Command::Search(args) => execute_search(args).map(CommandOutput::Search),
     }
 }
 
 fn execute_analyze(args: &AnalyzeArgs) -> Result<AnalysisResult> {
-    let options = resolve_options(args)?;
+    let options = resolve_options(&args.input, args.parser, &args.config)?;
+    let entries = load_entries(&options)?;
+    Ok(BasicAnalyzer.analyze(&entries))
+}
+
+fn execute_search(args: &SearchArgs) -> Result<Vec<LogEntry>> {
+    let options = resolve_options(&args.input, args.parser, &args.config)?;
+    let entries = load_entries(&options)?;
+    let condition = FilterCondition {
+        keyword: args.keyword.clone(),
+        level: args.level,
+        source: args.source.clone(),
+        start_time: args.start.map(LogTimestamp::new),
+        end_time: args.end.map(LogTimestamp::new),
+    };
+    let analyzer = BasicAnalyzer;
+    let mut matches = entries.iter().collect::<Vec<_>>();
+
+    if let Some(keyword) = condition.keyword.as_deref() {
+        retain_allowed(&mut matches, analyzer.search_keyword(&entries, keyword));
+    }
+    if let Some(level) = condition.level {
+        retain_allowed(&mut matches, analyzer.filter_by_level(&entries, level));
+    }
+    if let Some(source) = condition.source.as_deref() {
+        retain_allowed(&mut matches, analyzer.filter_by_source(&entries, source));
+    }
+    if condition.start_time.is_some() || condition.end_time.is_some() {
+        let start = condition
+            .start_time
+            .map(|timestamp| timestamp.value)
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        let end = condition
+            .end_time
+            .map(|timestamp| timestamp.value)
+            .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        retain_allowed(
+            &mut matches,
+            analyzer.filter_by_time_range(&entries, start, end),
+        );
+    }
+
+    let result = SearchResult::new(matches);
+    Ok(result.entries.into_iter().cloned().collect())
+}
+
+fn load_entries(options: &RuntimeOptions) -> Result<Vec<LogEntry>> {
     let content = fs::read_to_string(&options.input)
         .with_context(|| format!("failed to read input file {}", options.input.display()))?;
 
@@ -69,14 +147,28 @@ fn execute_analyze(args: &AnalyzeArgs) -> Result<AnalysisResult> {
         entries.push(entry);
     }
 
-    Ok(BasicAnalyzer.analyze(&entries))
+    Ok(entries)
 }
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    let result = execute(&cli)?;
-    println!("{}", format_analysis_summary(&result));
+    let output = execute(&cli)?;
+    println!("{}", format_command_output(&output));
     Ok(())
+}
+
+pub fn format_command_output(output: &CommandOutput) -> String {
+    match output {
+        CommandOutput::Analysis(result) => format_analysis_summary(result),
+        CommandOutput::Search(entries) => {
+            let mut display = format!("Matched entries: {}", entries.len());
+            for entry in entries {
+                display.push('\n');
+                display.push_str(&entry.raw);
+            }
+            display
+        }
+    }
 }
 
 /// Build deterministic text output for terminals and integration tests.
@@ -119,24 +211,39 @@ struct RuntimeOptions {
 }
 
 /// Resolve effective options with explicit CLI values taking precedence.
-fn resolve_options(args: &AnalyzeArgs) -> Result<RuntimeOptions> {
-    let config = args
-        .config
+fn resolve_options(
+    input: &Option<PathBuf>,
+    parser: Option<ParserKind>,
+    config_path: &Option<PathBuf>,
+) -> Result<RuntimeOptions> {
+    let config = config_path
         .as_ref()
         .map(LogScopeConfig::load_from_file)
         .transpose()?;
 
-    let input = args
-        .input
+    let input = input
         .clone()
         .or_else(|| config.as_ref().map(|config| PathBuf::from(&config.input)))
         .context("input file is required when no config file provides one")?;
-    let parser = args
-        .parser
+    let parser = parser
         .or_else(|| config.as_ref().map(|config| config.parser.into()))
         .unwrap_or(ParserKind::Text);
 
     Ok(RuntimeOptions { input, parser })
+}
+
+fn retain_allowed<'a>(current: &mut Vec<&'a LogEntry>, allowed: Vec<&'a LogEntry>) {
+    current.retain(|entry| allowed.contains(entry));
+}
+
+fn parse_log_level(value: &str) -> std::result::Result<LogLevel, String> {
+    LogLevel::from_label(value).ok_or_else(|| format!("unsupported log level: {value}"))
+}
+
+fn parse_utc_timestamp(value: &str) -> std::result::Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|_| format!("invalid RFC3339 timestamp: {value}"))
 }
 
 impl From<ParserFormat> for ParserKind {
@@ -150,7 +257,7 @@ impl From<ParserFormat> for ParserKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnalyzeArgs, Cli, Command, ParserKind, execute};
+    use super::{AnalysisResult, AnalyzeArgs, Cli, Command, CommandOutput, ParserKind, execute};
     use clap::Parser;
     use std::fs;
     use std::path::PathBuf;
@@ -199,10 +306,10 @@ mod tests {
         let path = write_temp_log("2026-06-12T10:00:00Z INFO api request completed\n");
         let cli = analyze_cli(Some(path.clone()), Some(ParserKind::Text), None);
 
-        let result = execute(&cli).unwrap();
+        let output = execute(&cli).unwrap();
 
         fs::remove_file(path).unwrap();
-        assert_eq!(result.total_count, 1);
+        assert_eq!(analysis_result(&output).total_count, 1);
     }
 
     #[test]
@@ -218,11 +325,11 @@ mod tests {
         );
         let cli = analyze_cli(None, None, Some(config_path.clone()));
 
-        let result = execute(&cli).unwrap();
+        let output = execute(&cli).unwrap();
 
         fs::remove_file(log_path).unwrap();
         fs::remove_file(config_path).unwrap();
-        assert_eq!(result.total_count, 1);
+        assert_eq!(analysis_result(&output).total_count, 1);
     }
 
     #[test]
@@ -239,16 +346,25 @@ mod tests {
             Some(config_path.clone()),
         );
 
-        let result = execute(&cli).unwrap();
+        let output = execute(&cli).unwrap();
 
         fs::remove_file(json_path).unwrap();
         fs::remove_file(config_path).unwrap();
-        assert_eq!(result.total_count, 1);
+        assert_eq!(analysis_result(&output).total_count, 1);
     }
 
     fn analyze_args(cli: &Cli) -> &AnalyzeArgs {
-        let Command::Analyze(args) = &cli.command;
+        let Command::Analyze(args) = &cli.command else {
+            panic!("expected analyze command");
+        };
         args
+    }
+
+    fn analysis_result(output: &CommandOutput) -> &AnalysisResult {
+        let CommandOutput::Analysis(result) = output else {
+            panic!("expected analysis output");
+        };
+        result
     }
 
     fn analyze_cli(

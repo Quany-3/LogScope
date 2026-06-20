@@ -1,5 +1,5 @@
 use clap::Parser;
-use log_scope::cli::{Cli, Command, ParserKind, execute, format_analysis_summary};
+use log_scope::cli::{Cli, Command, CommandOutput, ParserKind, execute, format_analysis_summary};
 use log_scope::model::LogLevel;
 
 #[test]
@@ -13,7 +13,9 @@ fn parses_analyze_subcommand() {
     ])
     .unwrap();
 
-    let Command::Analyze(args) = cli.command;
+    let Command::Analyze(args) = cli.command else {
+        panic!("expected analyze command");
+    };
     assert_eq!(args.input.unwrap().to_string_lossy(), "samples/plain.log");
     assert_eq!(args.parser, Some(ParserKind::Text));
 }
@@ -22,7 +24,9 @@ fn parses_analyze_subcommand() {
 fn connects_parser_and_analyzer_workflow() {
     let cli = Cli::try_parse_from(["logscope", "analyze", "samples/plain.log"]).unwrap();
 
-    let result = execute(&cli).unwrap();
+    let CommandOutput::Analysis(result) = execute(&cli).unwrap() else {
+        panic!("expected analysis output");
+    };
 
     assert_eq!(result.total_count, 3);
     assert_eq!(result.level_counts[&LogLevel::Info], 1);
@@ -34,7 +38,9 @@ fn connects_parser_and_analyzer_workflow() {
 #[test]
 fn formats_basic_analysis_summary() {
     let cli = Cli::try_parse_from(["logscope", "analyze", "samples/plain.log"]).unwrap();
-    let result = execute(&cli).unwrap();
+    let CommandOutput::Analysis(result) = execute(&cli).unwrap() else {
+        panic!("expected analysis output");
+    };
 
     let summary = format_analysis_summary(&result);
 
