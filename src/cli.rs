@@ -1,8 +1,8 @@
 pub const MODULE_NAME: &str = "cli";
 
-use crate::analyzer::{AnalysisResult, AnalysisService, BasicAnalyzer};
+use crate::analyzer::{AnalysisResult, BasicAnalyzer, SourceRanking};
 use crate::config::{LogScopeConfig, ParserFormat};
-use crate::model::{FilterCondition, LogEntry, LogLevel, LogTimestamp, SearchResult};
+use crate::model::{ErrorPattern, FilterCondition, LogEntry, LogLevel, LogTimestamp, SearchResult};
 use crate::parser::{JsonLineLogParser, LogParser, PlainTextLogParser};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -41,6 +41,12 @@ pub struct AnalyzeArgs {
     /// Optional TOML file providing input and parser defaults.
     #[arg(long)]
     pub config: Option<PathBuf>,
+    /// Number of source and error-pattern rankings to display.
+    #[arg(long, default_value_t = 5)]
+    pub top: usize,
+    /// Requests at or above this duration are considered slow.
+    #[arg(long, default_value_t = 1_000)]
+    pub slow_threshold_ms: u64,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -71,8 +77,16 @@ pub enum ParserKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvancedAnalysisOutput {
+    pub basic: AnalysisResult,
+    pub top_sources: Vec<SourceRanking>,
+    pub error_patterns: Vec<ErrorPattern>,
+    pub slow_requests: Vec<LogEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandOutput {
-    Analysis(AnalysisResult),
+    Analysis(AdvancedAnalysisOutput),
     Search(Vec<LogEntry>),
 }
 
@@ -84,10 +98,17 @@ pub fn execute(cli: &Cli) -> Result<CommandOutput> {
     }
 }
 
-fn execute_analyze(args: &AnalyzeArgs) -> Result<AnalysisResult> {
+fn execute_analyze(args: &AnalyzeArgs) -> Result<AdvancedAnalysisOutput> {
     let options = resolve_options(&args.input, args.parser, &args.config)?;
     let entries = load_entries(&options)?;
-    Ok(BasicAnalyzer.analyze(&entries))
+    let summary = BasicAnalyzer.build_summary(&entries, args.top, args.slow_threshold_ms);
+
+    Ok(AdvancedAnalysisOutput {
+        basic: summary.basic,
+        top_sources: summary.top_sources,
+        error_patterns: summary.error_patterns,
+        slow_requests: summary.slow_requests.into_iter().cloned().collect(),
+    })
 }
 
 fn execute_search(args: &SearchArgs) -> Result<Vec<LogEntry>> {
@@ -159,7 +180,7 @@ pub fn run() -> Result<()> {
 
 pub fn format_command_output(output: &CommandOutput) -> String {
     match output {
-        CommandOutput::Analysis(result) => format_analysis_summary(result),
+        CommandOutput::Analysis(result) => format_advanced_analysis_summary(result),
         CommandOutput::Search(entries) => {
             let mut display = format!("Matched entries: {}", entries.len());
             for entry in entries {
@@ -169,6 +190,31 @@ pub fn format_command_output(output: &CommandOutput) -> String {
             display
         }
     }
+}
+
+pub fn format_advanced_analysis_summary(result: &AdvancedAnalysisOutput) -> String {
+    let mut display = format_analysis_summary(&result.basic);
+
+    display.push_str("\nTop sources:");
+    for ranking in &result.top_sources {
+        display.push_str(&format!("\n  {}: {}", ranking.source, ranking.count));
+    }
+
+    display.push_str("\nTop error patterns:");
+    for pattern in &result.error_patterns {
+        display.push_str(&format!(
+            "\n  {}: {}",
+            pattern.signature, pattern.occurrences
+        ));
+    }
+
+    display.push_str(&format!("\nSlow requests: {}", result.slow_requests.len()));
+    for entry in &result.slow_requests {
+        display.push_str("\n  ");
+        display.push_str(&entry.raw);
+    }
+
+    display
 }
 
 /// Build deterministic text output for terminals and integration tests.
@@ -364,7 +410,7 @@ mod tests {
         let CommandOutput::Analysis(result) = output else {
             panic!("expected analysis output");
         };
-        result
+        &result.basic
     }
 
     fn analyze_cli(
@@ -377,6 +423,8 @@ mod tests {
                 input,
                 parser,
                 config,
+                top: 5,
+                slow_threshold_ms: 1_000,
             }),
         }
     }

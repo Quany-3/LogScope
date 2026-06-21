@@ -28,11 +28,11 @@ fn connects_parser_and_analyzer_workflow() {
         panic!("expected analysis output");
     };
 
-    assert_eq!(result.total_count, 3);
-    assert_eq!(result.level_counts[&LogLevel::Info], 1);
-    assert_eq!(result.level_counts[&LogLevel::Warn], 1);
-    assert_eq!(result.level_counts[&LogLevel::Error], 1);
-    assert_eq!(result.source_counts["api"], 2);
+    assert_eq!(result.basic.total_count, 3);
+    assert_eq!(result.basic.level_counts[&LogLevel::Info], 1);
+    assert_eq!(result.basic.level_counts[&LogLevel::Warn], 1);
+    assert_eq!(result.basic.level_counts[&LogLevel::Error], 1);
+    assert_eq!(result.basic.source_counts["api"], 2);
 }
 
 #[test]
@@ -42,7 +42,7 @@ fn formats_basic_analysis_summary() {
         panic!("expected analysis output");
     };
 
-    let summary = format_analysis_summary(&result);
+    let summary = format_analysis_summary(&result.basic);
 
     assert!(summary.contains("Total entries: 3"));
     assert!(summary.contains("INFO: 1"));
