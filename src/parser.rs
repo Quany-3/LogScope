@@ -3,6 +3,7 @@ pub const MODULE_NAME: &str = "parser";
 use crate::model::{LogEntry, LogLevel, LogSource, LogTimestamp};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 pub type ParseResult<T> = Result<T, ParseError>;
@@ -35,12 +36,14 @@ impl LogParser for PlainTextLogParser {
             .next()
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| ParseError::invalid_format(line))?;
+        let fields = extract_structured_fields(message);
 
         Ok(LogEntry {
             timestamp: LogTimestamp::new(parse_timestamp(timestamp)?),
             level: parse_level(level)?,
             source: LogSource::new(source),
             message: message.to_string(),
+            fields,
             raw: line.to_string(),
         })
     }
@@ -61,12 +64,14 @@ impl LogParser for JsonLineLogParser {
         let level = required_field(parsed.level, "level")?;
         let source = required_field(parsed.source, "source")?;
         let message = required_field(parsed.message, "message")?;
+        let fields = extract_structured_fields(&message);
 
         Ok(LogEntry {
             timestamp: LogTimestamp::new(parse_timestamp(&timestamp)?),
             level: parse_level(&level)?,
             source: LogSource::new(source),
             message,
+            fields,
             raw: line.to_string(),
         })
     }
@@ -227,4 +232,35 @@ mod tests {
         assert_eq!(text_entry.raw, text);
         assert_eq!(json_entry.raw, json);
     }
+
+    #[test]
+    fn extracts_structured_fields_from_messages() {
+        let text_entry = PlainTextLogParser
+            .parse_line("2026-06-12T10:02:00Z ERROR api request_failed status=500 duration_ms=125")
+            .unwrap();
+        let json_entry = JsonLineLogParser
+            .parse_line(
+                r#"{"timestamp":"2026-06-12T10:02:00Z","level":"ERROR","source":"api","message":"request_failed status=503 retry=true"}"#,
+            )
+            .unwrap();
+
+        assert_eq!(text_entry.fields["status"], "500");
+        assert_eq!(text_entry.fields["duration_ms"], "125");
+        assert_eq!(json_entry.fields["status"], "503");
+        assert_eq!(json_entry.fields["retry"], "true");
+    }
+}
+
+/// Extract whitespace-delimited key=value tokens while preserving the message.
+fn extract_structured_fields(message: &str) -> BTreeMap<String, String> {
+    message
+        .split_whitespace()
+        .filter_map(|token| {
+            let (key, value) = token.split_once('=')?;
+            if key.is_empty() || value.is_empty() {
+                return None;
+            }
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
 }

@@ -183,6 +183,7 @@ mod tests {
                 level: LogLevel::Info,
                 source: LogSource::new("api"),
                 message: "request completed".to_string(),
+                fields: Default::default(),
                 raw: "2026-06-12T10:00:00Z INFO api request completed".to_string(),
             },
             LogEntry {
@@ -190,6 +191,7 @@ mod tests {
                 level: LogLevel::Warn,
                 source: LogSource::new("worker"),
                 message: "retrying failed job".to_string(),
+                fields: Default::default(),
                 raw: "2026-06-12T10:01:00Z WARN worker retrying failed job".to_string(),
             },
             LogEntry {
@@ -197,6 +199,7 @@ mod tests {
                 level: LogLevel::Error,
                 source: LogSource::new("api"),
                 message: "database timeout".to_string(),
+                fields: Default::default(),
                 raw: "2026-06-12T10:02:00Z ERROR api database timeout".to_string(),
             },
         ]

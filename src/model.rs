@@ -2,6 +2,7 @@ pub const MODULE_NAME: &str = "model";
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Severity used for grouping, filtering, and ranking log records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -51,6 +52,8 @@ pub struct LogEntry {
     pub level: LogLevel,
     pub source: LogSource,
     pub message: String,
+    #[serde(default)]
+    pub fields: BTreeMap<String, String>,
     pub raw: String,
 }
 
@@ -121,7 +124,9 @@ impl<'a> SearchResult<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FilterCondition, LogEntry, LogLevel, LogSource, LogTimestamp, SearchResult};
+    use super::{
+        ErrorPattern, FilterCondition, LogEntry, LogLevel, LogSource, LogTimestamp, SearchResult,
+    };
     use chrono::{TimeZone, Utc};
 
     #[test]
@@ -146,6 +151,9 @@ mod tests {
             level: LogLevel::Error,
             source: LogSource::new("api"),
             message: "request failed".to_string(),
+            fields: [("status".to_string(), "500".to_string())]
+                .into_iter()
+                .collect(),
             raw: "2026-06-12T10:30:00Z ERROR api request failed".to_string(),
         };
 
@@ -153,6 +161,7 @@ mod tests {
         assert_eq!(entry.level, LogLevel::Error);
         assert_eq!(entry.source.name, "api");
         assert_eq!(entry.message, "request failed");
+        assert_eq!(entry.fields["status"], "500");
         assert!(entry.raw.contains("ERROR"));
     }
 
@@ -200,6 +209,7 @@ mod tests {
             level: LogLevel::Error,
             source: LogSource::new("api"),
             message: "database timeout".to_string(),
+            fields: Default::default(),
             raw: "2026-06-12T10:30:00Z ERROR api database timeout".to_string(),
         };
         let result = SearchResult::new(vec![&entry]);
@@ -207,5 +217,32 @@ mod tests {
         assert_eq!(result.total_matches, 1);
         assert_eq!(result.entries[0].message, "database timeout");
         assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn defines_error_pattern_model() {
+        let pattern = ErrorPattern::new("database timeout", "database timeout status=500");
+
+        assert_eq!(pattern.signature, "database timeout");
+        assert_eq!(pattern.occurrences, 1);
+        assert_eq!(pattern.sample_message, "database timeout status=500");
+    }
+}
+
+/// Repeated error signature produced by advanced analysis.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ErrorPattern {
+    pub signature: String,
+    pub occurrences: usize,
+    pub sample_message: String,
+}
+
+impl ErrorPattern {
+    pub fn new(signature: impl Into<String>, sample_message: impl Into<String>) -> Self {
+        Self {
+            signature: signature.into(),
+            occurrences: 1,
+            sample_message: sample_message.into(),
+        }
     }
 }
