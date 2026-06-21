@@ -1,5 +1,6 @@
 pub const MODULE_NAME: &str = "config";
 
+use crate::model::ReportExportFormat;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -10,6 +11,14 @@ use std::path::Path;
 pub struct LogScopeConfig {
     pub input: String,
     pub parser: ParserFormat,
+    #[serde(default)]
+    pub report: Option<ReportOutputConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportOutputConfig {
+    pub path: String,
+    pub format: ReportExportFormat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,7 +40,8 @@ impl LogScopeConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogScopeConfig, ParserFormat};
+    use super::{LogScopeConfig, ParserFormat, ReportOutputConfig};
+    use crate::model::ReportExportFormat;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,6 +50,7 @@ mod tests {
         let config = LogScopeConfig {
             input: "samples/plain.log".into(),
             parser: ParserFormat::Text,
+            report: None,
         };
 
         assert_eq!(config.input, "samples/plain.log");
@@ -56,6 +67,27 @@ mod tests {
         fs::remove_file(path).unwrap();
         assert_eq!(config.input, "samples/json.log");
         assert_eq!(config.parser, ParserFormat::Json);
+    }
+
+    #[test]
+    fn loads_report_output_configuration() {
+        let path = temp_config_path();
+        fs::write(
+            &path,
+            "input = \"samples/plain.log\"\nparser = \"text\"\n\n[report]\npath = \"reports/summary.md\"\nformat = \"markdown\"\n",
+        )
+        .unwrap();
+
+        let config = LogScopeConfig::load_from_file(&path).unwrap();
+
+        fs::remove_file(path).unwrap();
+        assert_eq!(
+            config.report,
+            Some(ReportOutputConfig {
+                path: "reports/summary.md".to_string(),
+                format: ReportExportFormat::Markdown,
+            })
+        );
     }
 
     fn temp_config_path() -> std::path::PathBuf {

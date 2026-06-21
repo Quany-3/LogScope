@@ -122,10 +122,35 @@ impl<'a> SearchResult<'a> {
     }
 }
 
+/// Context recorded alongside an exported report.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ReportMetadata {
+    pub generated_at: LogTimestamp,
+    pub source: String,
+    pub entry_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReportExportFormat {
+    Markdown,
+    Json,
+}
+
+impl ReportExportFormat {
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Markdown => "md",
+            Self::Json => "json",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ErrorPattern, FilterCondition, LogEntry, LogLevel, LogSource, LogTimestamp, SearchResult,
+        ErrorPattern, FilterCondition, LogEntry, LogLevel, LogSource, LogTimestamp,
+        ReportExportFormat, ReportMetadata, SearchResult,
     };
     use chrono::{TimeZone, Utc};
 
@@ -226,6 +251,21 @@ mod tests {
         assert_eq!(pattern.signature, "database timeout");
         assert_eq!(pattern.occurrences, 1);
         assert_eq!(pattern.sample_message, "database timeout status=500");
+    }
+
+    #[test]
+    fn defines_report_metadata_and_export_formats() {
+        let generated_at = LogTimestamp::new(Utc.with_ymd_and_hms(2026, 6, 21, 12, 0, 0).unwrap());
+        let metadata = ReportMetadata {
+            generated_at,
+            source: "samples/plain.log".to_string(),
+            entry_count: 3,
+        };
+
+        assert_eq!(metadata.generated_at, generated_at);
+        assert_eq!(metadata.source, "samples/plain.log");
+        assert_eq!(ReportExportFormat::Markdown.extension(), "md");
+        assert_eq!(ReportExportFormat::Json.extension(), "json");
     }
 }
 
