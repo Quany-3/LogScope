@@ -2,8 +2,15 @@ pub const MODULE_NAME: &str = "cli";
 
 use crate::analyzer::{AnalysisResult, BasicAnalyzer, SourceRanking};
 use crate::config::{LogScopeConfig, ParserFormat};
-use crate::model::{ErrorPattern, FilterCondition, LogEntry, LogLevel, LogTimestamp, SearchResult};
+use crate::model::{
+    ErrorPattern, FilterCondition, LogEntry, LogLevel, LogTimestamp, ReportExportFormat,
+    ReportMetadata, SearchResult,
+};
 use crate::parser::{JsonLineLogParser, LogParser, PlainTextLogParser};
+use crate::report::{
+    JsonReportWriter, MarkdownReportWriter, Report, ReportSectionBuilder, ReportWriter,
+};
+use crate::utils::write_file_safely;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -28,6 +35,8 @@ pub enum Command {
     Analyze(AnalyzeArgs),
     /// Search and filter parsed log entries.
     Search(SearchArgs),
+    /// Analyze logs and export a Markdown or JSON report.
+    Report(ReportArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -70,6 +79,26 @@ pub struct SearchArgs {
     pub end: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct ReportArgs {
+    #[arg(required_unless_present = "config")]
+    pub input: Option<PathBuf>,
+    #[arg(long = "parser", value_enum)]
+    pub parser: Option<ParserKind>,
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+    #[arg(long, value_parser = parse_report_format)]
+    pub format: Option<ReportExportFormat>,
+    #[arg(long, default_value = "LogScope Analysis Report")]
+    pub title: String,
+    #[arg(long, default_value_t = 5)]
+    pub top: usize,
+    #[arg(long, default_value_t = 1_000)]
+    pub slow_threshold_ms: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ParserKind {
     Text,
@@ -88,6 +117,7 @@ pub struct AdvancedAnalysisOutput {
 pub enum CommandOutput {
     Analysis(AdvancedAnalysisOutput),
     Search(Vec<LogEntry>),
+    Report(PathBuf),
 }
 
 /// Execute the requested command and return structured output.
@@ -95,6 +125,7 @@ pub fn execute(cli: &Cli) -> Result<CommandOutput> {
     match &cli.command {
         Command::Analyze(args) => execute_analyze(args).map(CommandOutput::Analysis),
         Command::Search(args) => execute_search(args).map(CommandOutput::Search),
+        Command::Report(args) => execute_report(args).map(CommandOutput::Report),
     }
 }
 
@@ -152,6 +183,63 @@ fn execute_search(args: &SearchArgs) -> Result<Vec<LogEntry>> {
     Ok(result.entries.into_iter().cloned().collect())
 }
 
+fn execute_report(args: &ReportArgs) -> Result<PathBuf> {
+    let options = resolve_options(&args.input, args.parser, &args.config)?;
+    let entries = load_entries(&options)?;
+    let summary = BasicAnalyzer.build_summary(&entries, args.top, args.slow_threshold_ms);
+    let config = args
+        .config
+        .as_ref()
+        .map(LogScopeConfig::load_from_file)
+        .transpose()?;
+    let configured_report = config.as_ref().and_then(|config| config.report.as_ref());
+    let format = args
+        .format
+        .or_else(|| configured_report.map(|report| report.format))
+        .unwrap_or(ReportExportFormat::Markdown);
+    let output = args
+        .output
+        .clone()
+        .or_else(|| configured_report.map(|report| PathBuf::from(&report.path)))
+        .unwrap_or_else(|| PathBuf::from(format!("logscope-report.{}", format.extension())));
+
+    let mut source_section = ReportSectionBuilder::new("Top Sources");
+    for ranking in &summary.top_sources {
+        source_section = source_section.line(format!("{}: {}", ranking.source, ranking.count));
+    }
+    let mut pattern_section = ReportSectionBuilder::new("Error Patterns");
+    for pattern in &summary.error_patterns {
+        pattern_section =
+            pattern_section.line(format!("{}: {}", pattern.signature, pattern.occurrences));
+    }
+    let mut slow_section = ReportSectionBuilder::new("Slow Requests");
+    for entry in &summary.slow_requests {
+        slow_section = slow_section.line(&entry.raw);
+    }
+
+    let report = Report {
+        title: args.title.clone(),
+        metadata: Some(ReportMetadata {
+            generated_at: LogTimestamp::new(Utc::now()),
+            source: options.input.display().to_string(),
+            entry_count: entries.len(),
+        }),
+        summary: summary.basic,
+        sections: vec![
+            source_section.build(),
+            pattern_section.build(),
+            slow_section.build(),
+        ],
+    };
+    let content = match format {
+        ReportExportFormat::Markdown => MarkdownReportWriter.write(&report)?,
+        ReportExportFormat::Json => JsonReportWriter.write(&report)?,
+    };
+    write_file_safely(&output, &content)?;
+
+    Ok(output)
+}
+
 fn load_entries(options: &RuntimeOptions) -> Result<Vec<LogEntry>> {
     let content = fs::read_to_string(&options.input)
         .with_context(|| format!("failed to read input file {}", options.input.display()))?;
@@ -189,6 +277,7 @@ pub fn format_command_output(output: &CommandOutput) -> String {
             }
             display
         }
+        CommandOutput::Report(path) => format!("Report written to: {}", path.display()),
     }
 }
 
@@ -290,6 +379,14 @@ fn parse_utc_timestamp(value: &str) -> std::result::Result<DateTime<Utc>, String
     DateTime::parse_from_rfc3339(value)
         .map(|timestamp| timestamp.with_timezone(&Utc))
         .map_err(|_| format!("invalid RFC3339 timestamp: {value}"))
+}
+
+fn parse_report_format(value: &str) -> std::result::Result<ReportExportFormat, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "markdown" | "md" => Ok(ReportExportFormat::Markdown),
+        "json" => Ok(ReportExportFormat::Json),
+        _ => Err(format!("unsupported report format: {value}")),
+    }
 }
 
 impl From<ParserFormat> for ParserKind {

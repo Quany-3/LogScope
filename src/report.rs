@@ -1,7 +1,7 @@
 pub const MODULE_NAME: &str = "report";
 
 use crate::analyzer::AnalysisResult;
-use crate::model::LogLevel;
+use crate::model::{LogLevel, ReportMetadata};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -9,6 +9,8 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Report {
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ReportMetadata>,
     pub summary: AnalysisResult,
     pub sections: Vec<ReportSection>,
 }
@@ -51,6 +53,13 @@ impl ReportWriter for MarkdownReportWriter {
             "# {}\n\nTotal entries: {}\n\n## Level counts\n",
             report.title, report.summary.total_count
         );
+
+        if let Some(metadata) = &report.metadata {
+            output.push_str(&format!(
+                "\nSource: {}\nGenerated at: {}\n",
+                metadata.source, metadata.generated_at.value
+            ));
+        }
 
         for level in [
             LogLevel::Trace,
@@ -127,6 +136,7 @@ mod tests {
     fn defines_report_data_structures() {
         let report = Report {
             title: "Daily LogScope Report".to_string(),
+            metadata: None,
             summary: AnalysisResult::new(12),
             sections: vec![ReportSection::new("Level Summary", "INFO: 10, ERROR: 2")],
         };
@@ -183,6 +193,7 @@ mod tests {
 
         Report {
             title: "Daily LogScope Report".to_string(),
+            metadata: None,
             summary,
             sections: vec![ReportSection::new("Notes", "Generated from sample logs.")],
         }
