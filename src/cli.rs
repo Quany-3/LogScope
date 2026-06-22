@@ -37,6 +37,8 @@ pub enum Command {
     Search(SearchArgs),
     /// Analyze logs and export a Markdown or JSON report.
     Report(ReportArgs),
+    /// Open the interactive terminal interface.
+    Tui,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -118,6 +120,7 @@ pub enum CommandOutput {
     Analysis(AdvancedAnalysisOutput),
     Search(Vec<LogEntry>),
     Report(PathBuf),
+    Tui,
 }
 
 /// Execute the requested command and return structured output.
@@ -126,6 +129,7 @@ pub fn execute(cli: &Cli) -> Result<CommandOutput> {
         Command::Analyze(args) => execute_analyze(args).map(CommandOutput::Analysis),
         Command::Search(args) => execute_search(args).map(CommandOutput::Search),
         Command::Report(args) => execute_report(args).map(CommandOutput::Report),
+        Command::Tui => crate::tui::run().map(|()| CommandOutput::Tui),
     }
 }
 
@@ -278,6 +282,7 @@ pub fn format_command_output(output: &CommandOutput) -> String {
             display
         }
         CommandOutput::Report(path) => format!("Report written to: {}", path.display()),
+        CommandOutput::Tui => "TUI session ended.".to_string(),
     }
 }
 
@@ -414,6 +419,13 @@ mod tests {
             analyze_args(&cli).input,
             Some(PathBuf::from("logs/app.log"))
         );
+    }
+
+    #[test]
+    fn parses_tui_subcommand() {
+        let cli = Cli::try_parse_from(["logscope", "tui"]).unwrap();
+
+        assert!(matches!(cli.command, Command::Tui));
     }
 
     #[test]
