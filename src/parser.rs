@@ -4,6 +4,9 @@ use crate::model::{LogEntry, LogLevel, LogSource, LogTimestamp};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub type ParseResult<T> = Result<T, ParseError>;
@@ -11,6 +14,42 @@ pub type ParseResult<T> = Result<T, ParseError>;
 /// Common interface for line-oriented log parsers.
 pub trait LogParser {
     fn parse_line(&self, line: &str) -> ParseResult<LogEntry>;
+}
+
+/// Parse a complete log file with a caller-selected line parser.
+pub fn parse_file(
+    path: impl AsRef<Path>,
+    parser: &dyn LogParser,
+) -> Result<Vec<LogEntry>, ParseFileError> {
+    let path = path.as_ref().to_path_buf();
+    let file = File::open(&path).map_err(|source| ParseFileError::Open {
+        path: path.clone(),
+        source,
+    })?;
+    let mut entries = Vec::new();
+
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line_number = index + 1;
+        let line = line.map_err(|source| ParseFileError::ReadLine {
+            path: path.clone(),
+            line_number,
+            source,
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let entry = parser
+            .parse_line(&line)
+            .map_err(|source| ParseFileError::ParseLine {
+                path: path.clone(),
+                line_number,
+                source,
+            })?;
+        entries.push(entry);
+    }
+
+    Ok(entries)
 }
 
 /// Parser for lines shaped as: timestamp level source message.
@@ -99,6 +138,36 @@ pub enum ParseError {
     MissingField { field: &'static str },
 }
 
+#[derive(Debug, Error)]
+pub enum ParseFileError {
+    #[error("failed to open log file {path}", path = .path.display())]
+    Open {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error(
+        "failed to read line {line_number} from log file {path}",
+        path = .path.display()
+    )]
+    ReadLine {
+        path: PathBuf,
+        line_number: usize,
+        #[source]
+        source: io::Error,
+    },
+    #[error(
+        "failed to parse line {line_number} in log file {path}: {source}",
+        path = .path.display()
+    )]
+    ParseLine {
+        path: PathBuf,
+        line_number: usize,
+        #[source]
+        source: ParseError,
+    },
+}
+
 impl ParseError {
     fn invalid_format(line: &str) -> Self {
         Self::InvalidFormat {
@@ -129,9 +198,14 @@ fn required_field(value: Option<String>, field: &'static str) -> ParseResult<Str
 
 #[cfg(test)]
 mod tests {
-    use super::{JsonLineLogParser, LogParser, ParseError, PlainTextLogParser};
+    use super::{
+        JsonLineLogParser, LogParser, ParseError, ParseFileError, PlainTextLogParser, parse_file,
+    };
     use crate::model::LogLevel;
     use chrono::{TimeZone, Utc};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parses_plain_text_log_line() {
@@ -248,6 +322,62 @@ mod tests {
         assert_eq!(text_entry.fields["duration_ms"], "125");
         assert_eq!(json_entry.fields["status"], "503");
         assert_eq!(json_entry.fields["retry"], "true");
+    }
+
+    #[test]
+    fn parses_text_file_and_skips_blank_lines() {
+        let path = write_temp_log(
+            "2026-06-12T10:00:00Z INFO api started\n\n2026-06-12T10:01:00Z ERROR api failed\n",
+        );
+
+        let entries = parse_file(&path, &PlainTextLogParser).unwrap();
+
+        fs::remove_file(path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].level, LogLevel::Error);
+    }
+
+    #[test]
+    fn parses_json_file_with_the_shared_helper() {
+        let path = write_temp_log(
+            r#"{"timestamp":"2026-06-12T10:00:00Z","level":"INFO","source":"api","message":"started"}
+"#,
+        );
+
+        let entries = parse_file(&path, &JsonLineLogParser).unwrap();
+
+        fs::remove_file(path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source.name, "api");
+    }
+
+    #[test]
+    fn reports_the_physical_line_number_for_invalid_entries() {
+        let path = write_temp_log(
+            "2026-06-12T10:00:00Z INFO api started\n\n2026-06-12T10:01:00Z NOTICE api failed\n",
+        );
+
+        let error = parse_file(&path, &PlainTextLogParser).unwrap_err();
+
+        fs::remove_file(path).unwrap();
+        assert!(matches!(
+            error,
+            ParseFileError::ParseLine {
+                line_number: 3,
+                source: ParseError::InvalidLevel { .. },
+                ..
+            }
+        ));
+    }
+
+    fn write_temp_log(content: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("logscope-parser-{suffix}.log"));
+        fs::write(&path, content).unwrap();
+        path
     }
 }
 

@@ -1,8 +1,9 @@
 pub const MODULE_NAME: &str = "model";
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 
 /// Severity used for grouping, filtering, and ranking log records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -45,6 +46,12 @@ impl LogLevel {
     }
 }
 
+impl fmt::Display for LogLevel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// One normalized log record produced by parsers and consumed by analyzers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LogEntry {
@@ -55,6 +62,25 @@ pub struct LogEntry {
     #[serde(default)]
     pub fields: BTreeMap<String, String>,
     pub raw: String,
+}
+
+impl LogEntry {
+    /// Format the timestamp consistently for fixed-column terminal views.
+    pub fn display_timestamp(&self) -> String {
+        self.timestamp
+            .value
+            .to_rfc3339_opts(SecondsFormat::Secs, true)
+    }
+
+    pub fn display_line(&self) -> String {
+        format!(
+            "{} {} {} {}",
+            self.display_timestamp(),
+            self.level,
+            self.source.name,
+            self.message
+        )
+    }
 }
 
 /// Logical origin of a log record, such as a service, file, or component.
@@ -191,6 +217,24 @@ mod tests {
     }
 
     #[test]
+    fn formats_log_entry_for_terminal_display() {
+        let entry = LogEntry {
+            timestamp: LogTimestamp::new(Utc.with_ymd_and_hms(2026, 6, 12, 10, 30, 0).unwrap()),
+            level: LogLevel::Error,
+            source: LogSource::new("api"),
+            message: "database timeout".to_string(),
+            fields: Default::default(),
+            raw: r#"{"level":"ERROR","message":"database timeout"}"#.to_string(),
+        };
+
+        assert_eq!(entry.display_timestamp(), "2026-06-12T10:30:00Z");
+        assert_eq!(
+            entry.display_line(),
+            "2026-06-12T10:30:00Z ERROR api database timeout"
+        );
+    }
+
+    #[test]
     fn defines_log_source_and_timestamp_models() {
         let source = LogSource::new("worker-1");
         let timestamp = Utc.with_ymd_and_hms(2026, 6, 12, 11, 0, 0).unwrap();
@@ -207,6 +251,12 @@ mod tests {
         assert_eq!(LogLevel::Error.as_str(), "ERROR");
         assert!(LogLevel::Error.is_error());
         assert!(LogLevel::Info < LogLevel::Error);
+    }
+
+    #[test]
+    fn formats_log_levels_for_display() {
+        assert_eq!(LogLevel::Warn.to_string(), "WARN");
+        assert_eq!(LogLevel::Fatal.to_string(), "FATAL");
     }
 
     #[test]
