@@ -64,7 +64,7 @@ pub(super) fn render_app(frame: &mut Frame<'_>, app: &App) {
     );
     frame.render_widget(
         Paragraph::new(Line::from(format!(
-            "{} | o open file | q/Esc exit",
+            "{} | o open | Space mark | Enter load | q/Esc exit",
             app.status_line()
         )))
         .alignment(Alignment::Center)

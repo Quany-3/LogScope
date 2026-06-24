@@ -1,4 +1,3 @@
-
 use crate::analyzer::{BasicAnalyzer, OperationalInsights, RealtimeSummary};
 use crate::model::{LogEntry, LogTimestamp, ReportMetadata};
 use crate::parser::{JsonLineLogParser, PlainTextLogParser, parse_file};
@@ -9,6 +8,7 @@ use crate::report::{
 use anyhow::{Context, Result};
 use chrono::Utc;
 use crossterm::event::{KeyCode, KeyEvent};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -85,11 +85,13 @@ impl App {
             open: true,
             files,
             selected_index: 0,
+            marked_indices: BTreeSet::new(),
         };
         if self.file_picker.files.is_empty() {
             self.status_message = "No log files found.".to_string();
         } else {
-            self.status_message = "Select a log file and press Enter.".to_string();
+            self.status_message =
+                "Select log files with Space, then press Enter to load.".to_string();
         }
     }
 
@@ -106,12 +108,17 @@ impl App {
             .iter()
             .enumerate()
             .map(|(index, path)| {
-                let marker = if index == self.file_picker.selected_index {
-                    "> "
+                let cursor = if index == self.file_picker.selected_index {
+                    ">"
                 } else {
-                    "  "
+                    " "
                 };
-                format!("{marker}{}", path.display())
+                let checked = if self.file_picker.marked_indices.contains(&index) {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
+                format!("{cursor} {checked} {}", path.display())
             })
             .collect()
     }
@@ -198,7 +205,8 @@ impl App {
             KeyCode::Esc if self.file_picker.open => self.file_picker.open = false,
             KeyCode::Char('q') | KeyCode::Esc => self.running = false,
             KeyCode::Char('o') => self.open_file_picker(),
-            KeyCode::Enter if self.file_picker.open => self.load_selected_file(),
+            KeyCode::Char(' ') if self.file_picker.open => self.toggle_file_picker_mark(),
+            KeyCode::Enter if self.file_picker.open => self.load_marked_files(),
             KeyCode::Down if self.file_picker.open => self.move_file_picker(1),
             KeyCode::Up if self.file_picker.open => self.move_file_picker(-1),
             KeyCode::Down => self.move_selection(1),
@@ -232,24 +240,49 @@ impl App {
             .min(last);
     }
 
-    fn load_selected_file(&mut self) {
-        let Some(path) = self
-            .file_picker
-            .files
-            .get(self.file_picker.selected_index)
-            .cloned()
-        else {
+    fn toggle_file_picker_mark(&mut self) {
+        if self.file_picker.files.is_empty() {
             return;
-        };
+        }
 
-        match parse_log_file(&path)
-            .and_then(|entries| Self::from_entries(path.display().to_string(), entries))
+        let index = self.file_picker.selected_index;
+        if !self.file_picker.marked_indices.remove(&index) {
+            self.file_picker.marked_indices.insert(index);
+        }
+        let count = self.file_picker.marked_indices.len();
+        self.status_message = format!("{count} file(s) selected. Press Enter to load.");
+    }
+
+    fn load_marked_files(&mut self) {
+        let paths = self.selected_file_picker_paths();
+        if paths.is_empty() {
+            return;
+        }
+
+        match parse_log_files(&paths)
+            .and_then(|entries| Self::from_entries(source_label_for_paths(&paths), entries))
         {
             Ok(next) => *self = next,
-            Err(error) => {
-                self.status_message = format!("Failed to load {}: {error}", path.display())
-            }
+            Err(error) => self.status_message = format!("Failed to load selected file(s): {error}"),
         }
+    }
+
+    fn selected_file_picker_paths(&self) -> Vec<PathBuf> {
+        if self.file_picker.marked_indices.is_empty() {
+            return self
+                .file_picker
+                .files
+                .get(self.file_picker.selected_index)
+                .cloned()
+                .into_iter()
+                .collect();
+        }
+
+        self.file_picker
+            .marked_indices
+            .iter()
+            .filter_map(|index| self.file_picker.files.get(*index).cloned())
+            .collect()
     }
 }
 
@@ -274,6 +307,7 @@ struct FilePickerState {
     open: bool,
     files: Vec<PathBuf>,
     selected_index: usize,
+    marked_indices: BTreeSet<usize>,
 }
 
 fn discover_log_files() -> Vec<PathBuf> {
@@ -314,6 +348,26 @@ fn parse_log_file(path: &Path) -> Result<Vec<LogEntry>> {
     }
     entries.sort_by_key(|entry| entry.timestamp.value);
     Ok(entries)
+}
+
+fn parse_log_files(paths: &[PathBuf]) -> Result<Vec<LogEntry>> {
+    let mut entries = Vec::new();
+    for path in paths {
+        // Each file may be text or JSON, so detection stays per-file.
+        entries.extend(
+            parse_log_file(path).with_context(|| format!("failed to load {}", path.display()))?,
+        );
+    }
+    entries.sort_by_key(|entry| entry.timestamp.value);
+    Ok(entries)
+}
+
+fn source_label_for_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn should_parse_as_json(path: &Path) -> Result<bool> {
@@ -469,7 +523,7 @@ mod tests {
         assert!(app.is_file_picker_open());
         assert_eq!(
             app.file_picker_lines(),
-            vec![format!("> {}", path.display())]
+            vec![format!("> [ ] {}", path.display())]
         );
 
         app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -478,6 +532,33 @@ mod tests {
         assert!(!app.is_file_picker_open());
         assert_eq!(app.summary().total_count, 1);
         assert_eq!(app.selected_entry_details()[1], "Level: ERROR");
+    }
+
+    #[test]
+    fn file_picker_loads_marked_log_files_together() {
+        let first = write_temp_log("2026-06-12T10:01:00Z ERROR api failed duration_ms=1200\n");
+        let second = write_temp_log("2026-06-12T10:00:00Z INFO worker started\n");
+        let mut app = App::default();
+        app.open_file_picker_with(vec![first.clone(), second.clone()]);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(
+            app.file_picker_lines(),
+            vec![
+                format!("  [x] {}", first.display()),
+                format!("> [x] {}", second.display())
+            ]
+        );
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        fs::remove_file(first).unwrap();
+        fs::remove_file(second).unwrap();
+        assert_eq!(app.summary().total_count, 2);
+        assert!(app.source_label().contains(", "));
+        assert_eq!(app.selected_entry_details()[1], "Level: INFO");
     }
 
     #[test]
