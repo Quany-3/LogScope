@@ -1,7 +1,7 @@
 pub const MODULE_NAME: &str = "parser";
 
 use crate::model::{LogEntry, LogLevel, LogSource, LogTimestamp};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -123,6 +123,10 @@ pub struct PlainTextLogParser;
 
 impl LogParser for PlainTextLogParser {
     fn parse_line(&self, line: &str) -> ParseResult<LogEntry> {
+        if let Some(entry) = parse_spring_logback_line(line)? {
+            return Ok(entry);
+        }
+
         let mut parts = line.splitn(4, char::is_whitespace);
         let timestamp = parts
             .next()
@@ -151,6 +155,74 @@ impl LogParser for PlainTextLogParser {
             raw: line.to_string(),
         })
     }
+}
+
+fn parse_spring_logback_line(line: &str) -> ParseResult<Option<LogEntry>> {
+    let Some((time, rest)) = line.split_once(char::is_whitespace) else {
+        return Ok(None);
+    };
+    let Ok(parsed_time) = NaiveTime::parse_from_str(time, "%H:%M:%S%.f") else {
+        return Ok(None);
+    };
+
+    let rest = rest.trim_start();
+    if !rest.starts_with('[') {
+        return Ok(None);
+    }
+    let Some(thread_end) = rest.find(']') else {
+        return Err(ParseError::invalid_format(line));
+    };
+    let thread = &rest[1..thread_end];
+    let after_thread = rest[thread_end + 1..].trim_start();
+    let (level, after_level) = after_thread
+        .split_once(char::is_whitespace)
+        .ok_or_else(|| ParseError::invalid_format(line))?;
+    let level = parse_level(level)?;
+    let (source, after_source) = after_level
+        .trim_start()
+        .split_once(" - ")
+        .ok_or_else(|| ParseError::invalid_format(line))?;
+    let (caller, message) = parse_logback_caller_and_message(after_source);
+    let mut fields = extract_structured_fields(message);
+    fields.insert("thread".to_string(), thread.to_string());
+    fields.insert("display_timestamp".to_string(), time.to_string());
+    if let Some(caller) = caller {
+        fields.insert("caller".to_string(), caller.to_string());
+    }
+
+    Ok(Some(LogEntry {
+        // Date-less logback rows keep a synthetic date internally for sorting.
+        timestamp: LogTimestamp::new(DateTime::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(1970, 1, 1)
+                .expect("valid synthetic date")
+                .and_time(parsed_time),
+            Utc,
+        )),
+        level,
+        source: LogSource::new(source.trim()),
+        message: message.to_string(),
+        fields,
+        raw: line.to_string(),
+    }))
+}
+
+fn parse_logback_caller_and_message(value: &str) -> (Option<&str>, &str) {
+    let value = value.trim_start();
+    if !value.starts_with('[') {
+        return (None, value);
+    }
+
+    let Some(caller_end) = value.find(']') else {
+        return (None, value);
+    };
+    let caller = &value[1..caller_end];
+    let after_caller = value[caller_end + 1..].trim_start();
+    let message = after_caller
+        .strip_prefix("- ")
+        .map(str::trim_start)
+        .unwrap_or(after_caller);
+
+    (Some(caller), message)
 }
 
 /// Parser for one JSON object per line with timestamp, level, source, and message fields.
@@ -415,6 +487,23 @@ mod tests {
         fs::remove_file(path).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].source.name, "api");
+    }
+
+    #[test]
+    fn parses_spring_logback_line_without_displaying_a_date() {
+        let parser = PlainTextLogParser;
+        let entry = parser
+            .parse_line(
+                "15:19:18.955 [background-preinit] INFO  o.h.v.i.util.Version - [<clinit>,21] - HV000001: Hibernate Validator 8.0.2.Final",
+            )
+            .unwrap();
+
+        assert_eq!(entry.display_timestamp(), "15:19:18.955");
+        assert_eq!(entry.level, LogLevel::Info);
+        assert_eq!(entry.source.name, "o.h.v.i.util.Version");
+        assert_eq!(entry.message, "HV000001: Hibernate Validator 8.0.2.Final");
+        assert_eq!(entry.fields["thread"], "background-preinit");
+        assert_eq!(entry.fields["caller"], "<clinit>,21");
     }
 
     #[test]

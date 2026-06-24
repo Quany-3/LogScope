@@ -67,6 +67,10 @@ pub struct LogEntry {
 impl LogEntry {
     /// Format the timestamp consistently for fixed-column terminal views.
     pub fn display_timestamp(&self) -> String {
+        if let Some(display_timestamp) = self.fields.get("display_timestamp") {
+            return display_timestamp.clone();
+        }
+
         self.timestamp
             .value
             .to_rfc3339_opts(SecondsFormat::Secs, true)

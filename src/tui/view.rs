@@ -49,7 +49,7 @@ pub(super) fn render_app(frame: &mut Frame<'_>, app: &App) {
         summary,
     );
     frame.render_widget(
-        Paragraph::new(app.selected_entry_details().join("\n"))
+        Paragraph::new(styled_selected_entry_details(app))
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
@@ -64,7 +64,7 @@ pub(super) fn render_app(frame: &mut Frame<'_>, app: &App) {
         ("Report Preview", app.report_preview_lines())
     };
     frame.render_widget(
-        Paragraph::new(preview_lines.join("\n"))
+        Paragraph::new(styled_preview_lines(preview_lines))
             .wrap(Wrap { trim: false })
             .block(Block::default().title(preview_title).borders(Borders::ALL)),
         preview,
@@ -123,6 +123,107 @@ fn styled_summary_lines(app: &App) -> Vec<Line<'static>> {
         .into_iter()
         .map(|line| Line::from(Span::styled(line.clone(), summary_style(&line))))
         .collect()
+}
+
+fn styled_selected_entry_details(app: &App) -> Vec<Line<'static>> {
+    app.selected_entry_details()
+        .into_iter()
+        .map(styled_detail_line)
+        .collect()
+}
+
+fn styled_detail_line(line: String) -> Line<'static> {
+    let Some((label, value)) = line.split_once(": ") else {
+        return Line::from(Span::styled(line, Style::default().fg(Color::Gray)));
+    };
+
+    let value_style = if label == "Level" {
+        LogLevel::from_label(value).map_or(Style::default(), level_style)
+    } else {
+        detail_value_style(label)
+    };
+
+    Line::from(vec![
+        Span::styled(
+            format!("{label}: "),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(value.to_string(), value_style),
+    ])
+}
+
+fn detail_value_style(label: &str) -> Style {
+    match label {
+        "Timestamp" => Style::default().fg(Color::Blue),
+        "Source" => Style::default().fg(Color::LightCyan),
+        "Message" => Style::default(),
+        "duration_ms" => Style::default().fg(Color::Yellow),
+        "status" => Style::default().fg(Color::Magenta),
+        _ => Style::default().fg(Color::Gray),
+    }
+}
+
+fn styled_preview_lines(lines: Vec<String>) -> Vec<Line<'static>> {
+    lines.into_iter().map(styled_preview_line).collect()
+}
+
+fn styled_preview_line(line: String) -> Line<'static> {
+    if line.starts_with("# ") {
+        return Line::from(Span::styled(
+            line,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if line.starts_with("## ") {
+        return Line::from(Span::styled(
+            line,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some((level, count)) = line
+        .strip_prefix("- ")
+        .and_then(|item| item.split_once(": "))
+        && let Some(level) = LogLevel::from_label(level)
+    {
+        return Line::from(vec![
+            Span::raw("- "),
+            Span::styled(level.to_string(), level_style(level)),
+            Span::raw(": "),
+            Span::styled(count.to_string(), Style::default().fg(Color::LightGreen)),
+        ]);
+    }
+    if let Some((label, value)) = line.split_once(": ") {
+        return Line::from(vec![
+            Span::styled(
+                format!("{label}: "),
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(value.to_string(), preview_value_style(label)),
+        ]);
+    }
+    if line.starts_with("... ") {
+        return Line::from(Span::styled(line, Style::default().fg(Color::Gray)));
+    }
+
+    Line::from(line)
+}
+
+fn preview_value_style(label: &str) -> Style {
+    match label {
+        "Total entries" => Style::default()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD),
+        "Source" | "Generated at" => Style::default().fg(Color::Gray),
+        _ => Style::default(),
+    }
 }
 
 fn summary_style(line: &str) -> Style {
@@ -187,7 +288,7 @@ fn level_style(level: LogLevel) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{level_style, render_app, summary_style};
+    use super::{level_style, render_app, styled_detail_line, styled_preview_line, summary_style};
     use crate::model::LogLevel;
     use crate::tui::app::App;
     use ratatui::Terminal;
@@ -228,6 +329,24 @@ mod tests {
             summary_style("Severity: 80/100"),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
         );
+    }
+
+    #[test]
+    fn styles_selected_entry_details_by_field_type() {
+        let line = styled_detail_line("Level: ERROR".to_string());
+
+        assert_eq!(line.spans[0].style.fg, Some(Color::Cyan));
+        assert_eq!(line.spans[1].style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn styles_report_preview_markdown_sections_and_level_counts() {
+        let heading = styled_preview_line("## Level counts".to_string());
+        let count = styled_preview_line("- WARN: 2".to_string());
+
+        assert_eq!(heading.spans[0].style.fg, Some(Color::Yellow));
+        assert_eq!(count.spans[1].style.fg, Some(Color::Yellow));
+        assert_eq!(count.spans[3].style.fg, Some(Color::LightGreen));
     }
 
     #[test]
