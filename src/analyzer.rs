@@ -1,7 +1,7 @@
 pub const MODULE_NAME: &str = "analyzer";
 
 use crate::model::{ErrorPattern, LogEntry, LogLevel};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
@@ -167,6 +167,40 @@ impl BasicAnalyzer {
                 .collect(),
         }
     }
+
+    pub fn build_insights(
+        &self,
+        entries: &[LogEntry],
+        window_seconds: i64,
+        slow_threshold_ms: u64,
+        correlation_limit: usize,
+    ) -> OperationalInsights {
+        let total_count = entries.len();
+        let error_count = entries
+            .iter()
+            .filter(|entry| entry.level.is_error())
+            .count();
+        let fatal_count = count_level(entries, LogLevel::Fatal);
+        let slow_count = self.detect_slow_requests(entries, slow_threshold_ms).len();
+        let error_rate_percent = percent(error_count, total_count);
+        let slow_rate_percent = percent(slow_count, total_count);
+        let peak_window = peak_window(entries, window_seconds.max(1));
+        let correlations = correlated_activity(entries, correlation_limit);
+        let severity_score = severity_score(
+            error_rate_percent,
+            slow_rate_percent,
+            fatal_count,
+            peak_window.as_ref(),
+        );
+
+        OperationalInsights {
+            severity_score,
+            error_rate_percent,
+            slow_rate_percent,
+            peak_window,
+            correlations,
+        }
+    }
 }
 
 fn error_signature(message: &str) -> String {
@@ -186,6 +220,129 @@ fn error_signature(message: &str) -> String {
 
 fn count_level(entries: &[LogEntry], level: LogLevel) -> usize {
     entries.iter().filter(|entry| entry.level == level).count()
+}
+
+fn percent(count: usize, total: usize) -> u8 {
+    count
+        .saturating_mul(100)
+        .checked_div(total)
+        .unwrap_or_default()
+        .min(100) as u8
+}
+
+fn severity_score(
+    error_rate_percent: u8,
+    slow_rate_percent: u8,
+    fatal_count: usize,
+    peak_window: Option<&TimeWindowInsight>,
+) -> u8 {
+    let peak_pressure = peak_window
+        .map(|window| {
+            window.error_count.saturating_mul(10) + window.warning_count.saturating_mul(4)
+        })
+        .unwrap_or_default();
+    (usize::from(error_rate_percent)
+        + usize::from(slow_rate_percent / 2)
+        + fatal_count * 30
+        + peak_pressure)
+        .min(100) as u8
+}
+
+fn peak_window(entries: &[LogEntry], window_seconds: i64) -> Option<TimeWindowInsight> {
+    let mut ordered = entries.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|entry| entry.timestamp.value);
+    let mut best: Option<TimeWindowInsight> = None;
+
+    for (index, first) in ordered.iter().enumerate() {
+        let end = first.timestamp.value + Duration::seconds(window_seconds);
+        let window_entries = ordered[index..]
+            .iter()
+            .take_while(|entry| entry.timestamp.value <= end)
+            .copied()
+            .collect::<Vec<_>>();
+        let entry_count = window_entries.len();
+        let error_count = window_entries
+            .iter()
+            .filter(|entry| entry.level.is_error())
+            .count();
+        let warning_count = window_entries
+            .iter()
+            .filter(|entry| entry.level == LogLevel::Warn)
+            .count();
+        let candidate = TimeWindowInsight {
+            start: first.timestamp.value,
+            end,
+            entry_count,
+            error_count,
+            warning_count,
+        };
+
+        let replace = best.as_ref().is_none_or(|current| {
+            candidate
+                .error_count
+                .cmp(&current.error_count)
+                .then_with(|| candidate.warning_count.cmp(&current.warning_count))
+                .then_with(|| candidate.entry_count.cmp(&current.entry_count))
+                .is_gt()
+        });
+        if replace {
+            best = Some(candidate);
+        }
+    }
+
+    best
+}
+
+fn correlated_activity(entries: &[LogEntry], limit: usize) -> Vec<CorrelationInsight> {
+    let mut grouped = BTreeMap::<String, Vec<&LogEntry>>::new();
+    for entry in entries {
+        for key in ["request_id", "job_id"] {
+            if let Some(value) = entry.fields.get(key) {
+                grouped
+                    .entry(format!("{key}={value}"))
+                    .or_default()
+                    .push(entry);
+            }
+        }
+    }
+
+    let mut groups = grouped
+        .into_iter()
+        .filter(|(_, entries)| entries.len() > 1)
+        .map(|(key, entries)| CorrelationInsight {
+            key,
+            entry_count: entries.len(),
+            error_count: entries
+                .iter()
+                .filter(|entry| entry.level.is_error())
+                .count(),
+            sources: unique_sources(&entries),
+            sample_messages: entries
+                .iter()
+                .take(3)
+                .map(|entry| entry.message.clone())
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    groups.sort_by(|left, right| {
+        right
+            .error_count
+            .cmp(&left.error_count)
+            .then_with(|| right.entry_count.cmp(&left.entry_count))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    groups.truncate(limit);
+    groups
+}
+
+fn unique_sources(entries: &[&LogEntry]) -> Vec<String> {
+    let mut sources = entries
+        .iter()
+        .map(|entry| entry.source.name.clone())
+        .collect::<Vec<_>>();
+    sources.sort();
+    sources.dedup();
+    sources
 }
 
 impl AnalysisService for BasicAnalyzer {
@@ -208,7 +365,7 @@ impl AnalysisService for BasicAnalyzer {
 mod tests {
     use super::{AnalysisResult, AnalysisService, BasicAnalyzer};
     use crate::model::{ErrorPattern, LogEntry, LogLevel, LogSource, LogTimestamp};
-    use chrono::{TimeZone, Utc};
+    use chrono::{Duration, TimeZone, Utc};
 
     #[test]
     fn defines_analysis_result_models() {
@@ -355,6 +512,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn builds_operational_insights_from_log_activity() {
+        let entries = insight_mock_entries();
+        let insights = BasicAnalyzer.build_insights(&entries, 60, 1_000, 3);
+
+        assert_eq!(insights.severity_score, 100);
+        assert_eq!(insights.error_rate_percent, 60);
+        assert_eq!(insights.slow_rate_percent, 40);
+        assert_eq!(insights.peak_window.as_ref().unwrap().entry_count, 4);
+        assert_eq!(insights.peak_window.as_ref().unwrap().error_count, 2);
+        assert_eq!(insights.correlations.len(), 2);
+        assert_eq!(insights.correlations[0].key, "request_id=req-9001");
+        assert_eq!(insights.correlations[0].error_count, 2);
+    }
+
     /// Shared sample entries for analyzer unit tests.
     fn mock_log_entries() -> Vec<LogEntry> {
         vec![
@@ -407,6 +579,60 @@ mod tests {
             message,
         }
     }
+
+    fn insight_mock_entries() -> Vec<LogEntry> {
+        vec![
+            insight_entry(LogLevel::Info, "api", "started request_id=req-9001", 0, 50),
+            insight_entry(
+                LogLevel::Error,
+                "api",
+                "database timeout request_id=req-9001",
+                10,
+                1_500,
+            ),
+            insight_entry(LogLevel::Warn, "worker", "retry job_id=job-77", 20, 1_100),
+            insight_entry(
+                LogLevel::Error,
+                "api",
+                "payment failed request_id=req-9001",
+                40,
+                900,
+            ),
+            insight_entry(
+                LogLevel::Fatal,
+                "worker",
+                "worker crashed job_id=job-77",
+                90,
+                80,
+            ),
+        ]
+    }
+
+    fn insight_entry(
+        level: LogLevel,
+        source: &str,
+        message: &str,
+        second_offset: u32,
+        duration_ms: u64,
+    ) -> LogEntry {
+        let message = format!("{message} duration_ms={duration_ms}");
+        let timestamp = Utc.with_ymd_and_hms(2026, 6, 12, 12, 0, 0).unwrap()
+            + Duration::seconds(second_offset.into());
+        LogEntry {
+            timestamp: LogTimestamp::new(timestamp),
+            level,
+            source: LogSource::new(source),
+            fields: message
+                .split_whitespace()
+                .filter_map(|token| {
+                    let (key, value) = token.split_once('=')?;
+                    Some((key.to_string(), value.to_string()))
+                })
+                .collect(),
+            raw: message.clone(),
+            message,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -432,4 +658,32 @@ pub struct RealtimeSummary {
     pub error_count: usize,
     pub top_sources: Vec<SourceRanking>,
     pub recent_lines: Vec<String>,
+}
+
+/// Higher-level operational signals used by reports and richer TUI panels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationalInsights {
+    pub severity_score: u8,
+    pub error_rate_percent: u8,
+    pub slow_rate_percent: u8,
+    pub peak_window: Option<TimeWindowInsight>,
+    pub correlations: Vec<CorrelationInsight>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeWindowInsight {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub entry_count: usize,
+    pub error_count: usize,
+    pub warning_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorrelationInsight {
+    pub key: String,
+    pub entry_count: usize,
+    pub error_count: usize,
+    pub sources: Vec<String>,
+    pub sample_messages: Vec<String>,
 }

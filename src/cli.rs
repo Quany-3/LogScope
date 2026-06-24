@@ -9,6 +9,7 @@ use crate::model::{
 use crate::parser::{JsonLineLogParser, LogParser, PlainTextLogParser, parse_file};
 use crate::report::{
     JsonReportWriter, MarkdownReportWriter, Report, ReportSectionBuilder, ReportWriter,
+    build_insight_section,
 };
 use crate::utils::write_file_safely;
 use anyhow::{Context, Result};
@@ -214,6 +215,7 @@ fn execute_report(args: &ReportArgs) -> Result<PathBuf> {
     let options = resolve_options(&args.input, args.parser, &args.config)?;
     let entries = load_entries(&options)?;
     let summary = BasicAnalyzer.build_summary(&entries, args.top, args.slow_threshold_ms);
+    let insights = BasicAnalyzer.build_insights(&entries, 60, args.slow_threshold_ms, args.top);
     let config = args
         .config
         .as_ref()
@@ -253,6 +255,7 @@ fn execute_report(args: &ReportArgs) -> Result<PathBuf> {
         }),
         summary: summary.basic,
         sections: vec![
+            build_insight_section(&insights),
             source_section.build(),
             pattern_section.build(),
             slow_section.build(),

@@ -25,6 +25,7 @@ fn exports_markdown_report_from_cli() {
     };
     let content = fs::read_to_string(path).unwrap();
     assert!(content.starts_with("# LogScope Analysis Report"));
+    assert!(content.contains("## Operational Insights"));
     assert!(content.contains("## Error Patterns"));
     assert!(format_command_output(&result).contains("Report written to:"));
     fs::remove_file(path).unwrap();

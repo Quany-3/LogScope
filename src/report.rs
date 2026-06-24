@@ -1,6 +1,6 @@
 pub const MODULE_NAME: &str = "report";
 
-use crate::analyzer::AnalysisResult;
+use crate::analyzer::{AnalysisResult, OperationalInsights};
 use crate::model::{LogLevel, ReportMetadata};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -123,6 +123,38 @@ pub fn build_report_preview(
     })
 }
 
+pub fn build_insight_section(insights: &OperationalInsights) -> ReportSection {
+    let mut builder = ReportSectionBuilder::new("Operational Insights")
+        .line(format!("Severity score: {}/100", insights.severity_score))
+        .line(format!("Error rate: {}%", insights.error_rate_percent))
+        .line(format!(
+            "Slow request rate: {}%",
+            insights.slow_rate_percent
+        ));
+
+    if let Some(window) = &insights.peak_window {
+        builder = builder.line(format!(
+            "Peak window: {} to {} ({} entries, {} errors, {} warnings)",
+            window.start, window.end, window.entry_count, window.error_count, window.warning_count
+        ));
+    }
+
+    if !insights.correlations.is_empty() {
+        builder = builder.line("Correlated activity:");
+        for group in &insights.correlations {
+            builder = builder.line(format!(
+                "{}: {} entries, {} errors, sources={}",
+                group.key,
+                group.entry_count,
+                group.error_count,
+                group.sources.join(",")
+            ));
+        }
+    }
+
+    builder.build()
+}
+
 /// Small fluent builder for assembling multi-line report sections.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportSectionBuilder {
@@ -214,6 +246,34 @@ mod tests {
         assert_eq!(preview.total_lines, 14);
         assert!(preview.truncated);
         assert_eq!(preview.lines[0], "# Daily LogScope Report");
+    }
+
+    #[test]
+    fn builds_operational_insight_report_section() {
+        let insights = crate::analyzer::OperationalInsights {
+            severity_score: 88,
+            error_rate_percent: 25,
+            slow_rate_percent: 40,
+            peak_window: None,
+            correlations: vec![crate::analyzer::CorrelationInsight {
+                key: "request_id=req-42".to_string(),
+                entry_count: 3,
+                error_count: 2,
+                sources: vec!["api".to_string(), "db".to_string()],
+                sample_messages: vec!["database timeout".to_string()],
+            }],
+        };
+
+        let section = super::build_insight_section(&insights);
+
+        assert_eq!(section.heading, "Operational Insights");
+        assert!(section.body.contains("Severity score: 88/100"));
+        assert!(section.body.contains("Error rate: 25%"));
+        assert!(
+            section
+                .body
+                .contains("request_id=req-42: 3 entries, 2 errors")
+        );
     }
 
     fn render_report(writer: &dyn ReportWriter, report: &Report) -> String {
