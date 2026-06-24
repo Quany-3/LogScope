@@ -1,0 +1,8 @@
+2026-06-24T10:00:00Z INFO worker job_started job_id=job-2001 queue=email
+2026-06-24T10:00:03Z INFO worker job_completed job_id=job-2001 queue=email duration_ms=310
+2026-06-24T10:05:00Z INFO scheduler job_enqueued job_id=job-2002 queue=invoice
+2026-06-24T10:05:04Z WARN worker retry_scheduled job_id=job-2002 attempt=1 duration_ms=1400
+2026-06-24T10:06:08Z ERROR worker job_failed job_id=job-2002 error=timeout duration_ms=2200
+2026-06-24T10:10:00Z INFO worker job_started job_id=job-2003 queue=sync
+2026-06-24T10:10:02Z WARN worker high_memory_usage job_id=job-2003 memory_mb=768 duration_ms=900
+2026-06-24T10:10:05Z INFO worker job_completed job_id=job-2003 queue=sync duration_ms=5100

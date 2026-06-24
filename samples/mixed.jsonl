@@ -1,0 +1,8 @@
+{"timestamp":"2026-06-24T11:00:00Z","level":"INFO","source":"gateway","message":"request_started request_id=req-3001 path=/api/cart method=GET"}
+{"timestamp":"2026-06-24T11:00:01Z","level":"INFO","source":"api","message":"request_completed request_id=req-3001 status=200 duration_ms=64"}
+{"timestamp":"2026-06-24T11:02:10Z","level":"WARN","source":"cache","message":"cache_miss key=user:42 duration_ms=30"}
+{"timestamp":"2026-06-24T11:02:12Z","level":"ERROR","source":"api","message":"database timeout request_id=req-3002 status=500 duration_ms=1600"}
+{"timestamp":"2026-06-24T11:03:30Z","level":"INFO","source":"worker","message":"job_started job_id=job-3001 queue=report"}
+{"timestamp":"2026-06-24T11:03:35Z","level":"WARN","source":"worker","message":"slow_request job_id=job-3001 duration_ms=1250"}
+{"timestamp":"2026-06-24T11:03:38Z","level":"ERROR","source":"worker","message":"job_failed job_id=job-3001 error=network duration_ms=1600"}
+{"timestamp":"2026-06-24T11:04:00Z","level":"INFO","source":"api","message":"request_completed request_id=req-3003 status=204 duration_ms=90"}
