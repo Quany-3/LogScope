@@ -161,6 +161,7 @@ pub struct ReportMetadata {
 pub enum ReportExportFormat {
     Markdown,
     Json,
+    Html,
 }
 
 impl ReportExportFormat {
@@ -168,6 +169,7 @@ impl ReportExportFormat {
         match self {
             Self::Markdown => "md",
             Self::Json => "json",
+            Self::Html => "html",
         }
     }
 }
@@ -316,6 +318,7 @@ mod tests {
         assert_eq!(metadata.source, "samples/plain.log");
         assert_eq!(ReportExportFormat::Markdown.extension(), "md");
         assert_eq!(ReportExportFormat::Json.extension(), "json");
+        assert_eq!(ReportExportFormat::Html.extension(), "html");
     }
 }
 

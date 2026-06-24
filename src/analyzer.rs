@@ -186,6 +186,7 @@ impl BasicAnalyzer {
         let slow_rate_percent = percent(slow_count, total_count);
         let peak_window = peak_window(entries, window_seconds.max(1));
         let correlations = correlated_activity(entries, correlation_limit);
+        let file_activity = file_activity(entries, slow_threshold_ms, correlation_limit);
         let severity_score = severity_score(
             error_rate_percent,
             slow_rate_percent,
@@ -198,6 +199,7 @@ impl BasicAnalyzer {
             error_rate_percent,
             slow_rate_percent,
             peak_window,
+            file_activity,
             correlations,
         }
     }
@@ -206,8 +208,8 @@ impl BasicAnalyzer {
 fn error_signature(message: &str) -> String {
     let signature = message
         .split_whitespace()
-        .filter(|token| !token.contains('='))
-        .map(str::to_ascii_lowercase)
+        .filter_map(normalize_error_token)
+        .map(|token| token.to_ascii_lowercase())
         .collect::<Vec<_>>()
         .join(" ");
 
@@ -216,6 +218,85 @@ fn error_signature(message: &str) -> String {
     } else {
         signature
     }
+}
+
+fn normalize_error_token(token: &str) -> Option<String> {
+    let token = token.trim_matches(|character: char| character == ',' || character == ';');
+    if token.is_empty() {
+        return None;
+    }
+
+    if let Some((key, value)) = token.split_once('=') {
+        if should_drop_structured_key(key) {
+            return None;
+        }
+        return Some(format!("{key}={}", normalize_dynamic_value(value)));
+    }
+
+    Some(normalize_dynamic_value(token))
+}
+
+fn should_drop_structured_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "duration_ms"
+            | "trace_id"
+            | "request_id"
+            | "job_id"
+            | "order"
+            | "order_id"
+            | "status"
+            | "user_id"
+    )
+}
+
+fn normalize_dynamic_value(value: &str) -> String {
+    if is_ipv4(value) {
+        return "<ip>".to_string();
+    }
+    if is_uuid(value) {
+        return "<uuid>".to_string();
+    }
+    if value.chars().all(|character| character.is_ascii_digit()) {
+        return "<num>".to_string();
+    }
+    if value.contains('/') {
+        return normalize_path_value(value);
+    }
+    value.to_string()
+}
+
+fn normalize_path_value(value: &str) -> String {
+    value
+        .split('/')
+        .map(|segment| {
+            if segment.chars().all(|character| character.is_ascii_digit()) && !segment.is_empty() {
+                "<num>"
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn is_ipv4(value: &str) -> bool {
+    let parts = value.split('.').collect::<Vec<_>>();
+    parts.len() == 4
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.chars().all(|character| character.is_ascii_digit())
+                && part.parse::<u8>().is_ok()
+        })
+}
+
+fn is_uuid(value: &str) -> bool {
+    let groups = value.split('-').collect::<Vec<_>>();
+    let lengths = [8, 4, 4, 4, 12];
+    groups.len() == lengths.len()
+        && groups.iter().zip(lengths).all(|(group, length)| {
+            group.len() == length && group.chars().all(|character| character.is_ascii_hexdigit())
+        })
 }
 
 fn count_level(entries: &[LogEntry], level: LogLevel) -> usize {
@@ -252,27 +333,39 @@ fn peak_window(entries: &[LogEntry], window_seconds: i64) -> Option<TimeWindowIn
     let mut ordered = entries.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|entry| entry.timestamp.value);
     let mut best: Option<TimeWindowInsight> = None;
+    let mut left = 0usize;
+    let mut error_count = 0usize;
+    let mut warning_count = 0usize;
 
-    for (index, first) in ordered.iter().enumerate() {
-        let end = first.timestamp.value + Duration::seconds(window_seconds);
-        let window_entries = ordered[index..]
-            .iter()
-            .take_while(|entry| entry.timestamp.value <= end)
-            .copied()
-            .collect::<Vec<_>>();
-        let entry_count = window_entries.len();
-        let error_count = window_entries
-            .iter()
-            .filter(|entry| entry.level.is_error())
-            .count();
-        let warning_count = window_entries
-            .iter()
-            .filter(|entry| entry.level == LogLevel::Warn)
-            .count();
+    for (right, entry) in ordered.iter().enumerate() {
+        if entry.level.is_error() {
+            error_count += 1;
+        }
+        if entry.level == LogLevel::Warn {
+            warning_count += 1;
+        }
+
+        // Keep one rolling window instead of rebuilding a Vec for every row.
+        while left <= right {
+            let end = ordered[left].timestamp.value + Duration::seconds(window_seconds);
+            if entry.timestamp.value <= end {
+                break;
+            }
+            let removed = ordered[left];
+            if removed.level.is_error() {
+                error_count -= 1;
+            }
+            if removed.level == LogLevel::Warn {
+                warning_count -= 1;
+            }
+            left += 1;
+        }
+
+        let start = ordered[left].timestamp.value;
         let candidate = TimeWindowInsight {
-            start: first.timestamp.value,
-            end,
-            entry_count,
+            start,
+            end: start + Duration::seconds(window_seconds),
+            entry_count: right - left + 1,
             error_count,
             warning_count,
         };
@@ -333,6 +426,74 @@ fn correlated_activity(entries: &[LogEntry], limit: usize) -> Vec<CorrelationIns
     });
     groups.truncate(limit);
     groups
+}
+
+fn file_activity(
+    entries: &[LogEntry],
+    slow_threshold_ms: u64,
+    limit: usize,
+) -> Vec<FileActivityInsight> {
+    let mut grouped = BTreeMap::<String, Vec<&LogEntry>>::new();
+    for entry in entries {
+        if let Some(path) = entry.fields.get("origin_file") {
+            grouped.entry(path.clone()).or_default().push(entry);
+        }
+    }
+
+    let mut activity = grouped
+        .into_iter()
+        .map(|(path, entries)| {
+            let total_count = entries.len();
+            let warning_count = entries
+                .iter()
+                .filter(|entry| entry.level == LogLevel::Warn)
+                .count();
+            let error_count = entries
+                .iter()
+                .filter(|entry| entry.level.is_error())
+                .count();
+            let fatal_count = entries
+                .iter()
+                .filter(|entry| entry.level == LogLevel::Fatal)
+                .count();
+            let slow_count = entries
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .fields
+                        .get("duration_ms")
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .is_some_and(|duration| duration >= slow_threshold_ms)
+                })
+                .count();
+            let error_rate_percent = percent(error_count, total_count);
+            let slow_rate_percent = percent(slow_count, total_count);
+            let severity_score =
+                severity_score(error_rate_percent, slow_rate_percent, fatal_count, None);
+
+            FileActivityInsight {
+                path,
+                total_count,
+                warning_count,
+                error_count,
+                fatal_count,
+                slow_count,
+                error_rate_percent,
+                severity_score,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    activity.sort_by(|left, right| {
+        right
+            .severity_score
+            .cmp(&left.severity_score)
+            .then_with(|| right.error_count.cmp(&left.error_count))
+            .then_with(|| right.fatal_count.cmp(&left.fatal_count))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    activity.truncate(limit);
+    activity
 }
 
 fn unique_sources(entries: &[&LogEntry]) -> Vec<String> {
@@ -468,6 +629,39 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_dynamic_values_in_error_patterns() {
+        let entries = vec![
+            advanced_entry(
+                LogLevel::Error,
+                "api",
+                "request failed for user 123 order=9001 path=/users/123 ip=10.0.0.5 trace_id=550e8400-e29b-41d4-a716-446655440000",
+                80,
+            ),
+            advanced_entry(
+                LogLevel::Error,
+                "api",
+                "request failed for user 456 order=9002 path=/users/456 ip=10.0.0.8 trace_id=550e8400-e29b-41d4-a716-446655440111",
+                90,
+            ),
+            advanced_entry(
+                LogLevel::Error,
+                "api",
+                "request failed for user 789 order=9003 path=/users/789 ip=10.0.0.9 trace_id=550e8400-e29b-41d4-a716-446655440222",
+                100,
+            ),
+        ];
+
+        let patterns = BasicAnalyzer.top_error_patterns(&entries, 3);
+
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(
+            patterns[0].signature,
+            "request failed for user <num> path=/users/<num> ip=<ip>"
+        );
+        assert_eq!(patterns[0].occurrences, 3);
+    }
+
+    #[test]
     fn detects_slow_requests_from_structured_duration() {
         let entries = advanced_mock_entries();
         let slow = BasicAnalyzer.detect_slow_requests(&entries, 1_000);
@@ -525,6 +719,38 @@ mod tests {
         assert_eq!(insights.correlations.len(), 2);
         assert_eq!(insights.correlations[0].key, "request_id=req-9001");
         assert_eq!(insights.correlations[0].error_count, 2);
+    }
+
+    #[test]
+    fn builds_file_activity_from_origin_file_fields() {
+        let mut entries = insight_mock_entries();
+        entries[0]
+            .fields
+            .insert("origin_file".to_string(), "api.log".to_string());
+        entries[1]
+            .fields
+            .insert("origin_file".to_string(), "api.log".to_string());
+        entries[2]
+            .fields
+            .insert("origin_file".to_string(), "worker.log".to_string());
+        entries[3]
+            .fields
+            .insert("origin_file".to_string(), "worker.log".to_string());
+        entries[4]
+            .fields
+            .insert("origin_file".to_string(), "worker.log".to_string());
+
+        let insights = BasicAnalyzer.build_insights(&entries, 60, 1_000, 3);
+
+        assert_eq!(insights.file_activity.len(), 2);
+        assert_eq!(insights.file_activity[0].path, "worker.log");
+        assert_eq!(insights.file_activity[0].total_count, 3);
+        assert_eq!(insights.file_activity[0].error_count, 2);
+        assert_eq!(insights.file_activity[0].fatal_count, 1);
+        assert_eq!(insights.file_activity[0].slow_count, 1);
+        assert!(
+            insights.file_activity[0].severity_score > insights.file_activity[1].severity_score
+        );
     }
 
     /// Shared sample entries for analyzer unit tests.
@@ -667,6 +893,7 @@ pub struct OperationalInsights {
     pub error_rate_percent: u8,
     pub slow_rate_percent: u8,
     pub peak_window: Option<TimeWindowInsight>,
+    pub file_activity: Vec<FileActivityInsight>,
     pub correlations: Vec<CorrelationInsight>,
 }
 
@@ -686,4 +913,16 @@ pub struct CorrelationInsight {
     pub error_count: usize,
     pub sources: Vec<String>,
     pub sample_messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileActivityInsight {
+    pub path: String,
+    pub total_count: usize,
+    pub warning_count: usize,
+    pub error_count: usize,
+    pub fatal_count: usize,
+    pub slow_count: usize,
+    pub error_rate_percent: u8,
+    pub severity_score: u8,
 }

@@ -10,7 +10,7 @@ pub(super) fn render_app(frame: &mut Frame<'_>, app: &App) {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(1),
-        Constraint::Length(3),
+        Constraint::Length(4),
     ])
     .areas(frame.area());
     let [logs, side] =
@@ -30,13 +30,20 @@ pub(super) fn render_app(frame: &mut Frame<'_>, app: &App) {
         header,
     );
     frame.render_widget(
-        Paragraph::new(styled_log_lines(app))
-            .wrap(Wrap { trim: false })
-            .block(Block::default().title("Logs").borders(Borders::ALL)),
+        Paragraph::new(styled_log_lines(
+            app,
+            logs.height.saturating_sub(2) as usize,
+        ))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title(format!("Logs [{}]", app.filter_label()))
+                .borders(Borders::ALL),
+        ),
         logs,
     );
     frame.render_widget(
-        Paragraph::new(app.summary_lines().join("\n"))
+        Paragraph::new(styled_summary_lines(app))
             .wrap(Wrap { trim: false })
             .block(Block::default().title("Summary").borders(Borders::ALL)),
         summary,
@@ -63,25 +70,34 @@ pub(super) fn render_app(frame: &mut Frame<'_>, app: &App) {
         preview,
     );
     frame.render_widget(
-        Paragraph::new(Line::from(format!(
-            "{} | o open | Space mark | Enter load | q/Esc exit",
-            app.status_line()
-        )))
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                app.status_line().to_string(),
+                Style::default().fg(Color::Cyan),
+            )),
+            Line::from(Span::styled(
+                app.hint_line(),
+                Style::default().fg(Color::Gray),
+            )),
+        ])
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL)),
         footer,
     );
 }
 
-fn styled_log_lines(app: &App) -> Vec<Line<'static>> {
+fn styled_log_lines(app: &App, max_rows: usize) -> Vec<Line<'static>> {
     if app.entries().is_empty() {
         return vec![Line::from("No log file loaded.")];
     }
 
-    app.entries()
-        .iter()
-        .take(20)
-        .enumerate()
+    let visible_entries = app.visible_log_entries(max_rows);
+    if visible_entries.is_empty() {
+        return vec![Line::from("No logs match the active filter.")];
+    }
+
+    visible_entries
+        .into_iter()
         .map(|(index, entry)| {
             let marker = if app.selected_index() == Some(index) {
                 "> "
@@ -102,6 +118,63 @@ fn styled_log_lines(app: &App) -> Vec<Line<'static>> {
         .collect()
 }
 
+fn styled_summary_lines(app: &App) -> Vec<Line<'static>> {
+    app.summary_lines()
+        .into_iter()
+        .map(|line| Line::from(Span::styled(line.clone(), summary_style(&line))))
+        .collect()
+}
+
+fn summary_style(line: &str) -> Style {
+    if line.starts_with("Errors:") || line.contains("errors ") {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else if line.starts_with("Warnings:") {
+        Style::default().fg(Color::Yellow)
+    } else if line.starts_with("Severity:") {
+        severity_style(line)
+    } else if line.starts_with("Error rate:") {
+        rate_style(line, Color::Red)
+    } else if line.starts_with("Slow rate:") {
+        rate_style(line, Color::Yellow)
+    } else if line.starts_with("Filter:") {
+        Style::default().fg(Color::Cyan)
+    } else if line.ends_with(':') {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    }
+}
+
+fn severity_style(line: &str) -> Style {
+    let value = line
+        .strip_prefix("Severity: ")
+        .and_then(|value| value.split('/').next())
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or_default();
+
+    match value {
+        70..=100 => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        35..=69 => Style::default().fg(Color::Yellow),
+        _ => Style::default().fg(Color::Green),
+    }
+}
+
+fn rate_style(line: &str, active_color: Color) -> Style {
+    let value = line
+        .split_once(':')
+        .and_then(|(_, value)| value.trim().strip_suffix('%'))
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or_default();
+
+    if value > 0 {
+        Style::default()
+            .fg(active_color)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green)
+    }
+}
+
 fn level_style(level: LogLevel) -> Style {
     match level {
         LogLevel::Trace | LogLevel::Debug => Style::default().fg(Color::Gray),
@@ -114,9 +187,12 @@ fn level_style(level: LogLevel) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::level_style;
+    use super::{level_style, render_app, summary_style};
     use crate::model::LogLevel;
-    use ratatui::style::{Color, Style};
+    use crate::tui::app::App;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::style::{Color, Modifier, Style};
 
     #[test]
     fn styles_log_levels_by_urgency() {
@@ -136,5 +212,39 @@ mod tests {
             level_style(LogLevel::Fatal),
             Style::default().fg(Color::Magenta)
         );
+    }
+
+    #[test]
+    fn styles_summary_counts_by_urgency() {
+        assert_eq!(
+            summary_style("Warnings: 2"),
+            Style::default().fg(Color::Yellow)
+        );
+        assert_eq!(
+            summary_style("Errors: 1"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(
+            summary_style("Severity: 80/100"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn renders_footer_operation_hint() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::default();
+
+        terminal.draw(|frame| render_app(frame, &app)).unwrap();
+
+        let output = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(output.contains("/ search"));
     }
 }

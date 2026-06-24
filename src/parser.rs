@@ -21,12 +21,24 @@ pub fn parse_file(
     path: impl AsRef<Path>,
     parser: &dyn LogParser,
 ) -> Result<Vec<LogEntry>, ParseFileError> {
+    let mut entries = Vec::new();
+    parse_file_with(path, parser, |entry| {
+        entries.push(entry);
+    })?;
+    Ok(entries)
+}
+
+/// Stream parsed entries to the caller without building an intermediate list.
+pub fn parse_file_with(
+    path: impl AsRef<Path>,
+    parser: &dyn LogParser,
+    mut visitor: impl FnMut(LogEntry),
+) -> Result<(), ParseFileError> {
     let path = path.as_ref().to_path_buf();
     let file = File::open(&path).map_err(|source| ParseFileError::Open {
         path: path.clone(),
         source,
     })?;
-    let mut entries = Vec::new();
 
     for (index, line) in BufReader::new(file).lines().enumerate() {
         let line_number = index + 1;
@@ -46,10 +58,63 @@ pub fn parse_file(
                 line_number,
                 source,
             })?;
-        entries.push(entry);
+        visitor(entry);
     }
 
-    Ok(entries)
+    Ok(())
+}
+
+/// Parse a log file after detecting whether its first non-empty line is JSON.
+pub fn parse_file_auto(path: impl AsRef<Path>) -> Result<Vec<LogEntry>, ParseFileError> {
+    let path = path.as_ref();
+    if should_parse_as_json(path)? {
+        parse_file(path, &JsonLineLogParser)
+    } else {
+        parse_file(path, &PlainTextLogParser)
+    }
+}
+
+/// Stream a log file after detecting whether its first non-empty line is JSON.
+pub fn parse_file_auto_with(
+    path: impl AsRef<Path>,
+    visitor: impl FnMut(LogEntry),
+) -> Result<(), ParseFileError> {
+    let path = path.as_ref();
+    if should_parse_as_json(path)? {
+        parse_file_with(path, &JsonLineLogParser, visitor)
+    } else {
+        parse_file_with(path, &PlainTextLogParser, visitor)
+    }
+}
+
+fn should_parse_as_json(path: &Path) -> Result<bool, ParseFileError> {
+    if matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("json" | "jsonl")
+    ) {
+        return Ok(true);
+    }
+
+    let path = path.to_path_buf();
+    let file = File::open(&path).map_err(|source| ParseFileError::Open {
+        path: path.clone(),
+        source,
+    })?;
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line_number = index + 1;
+        let line = line.map_err(|source| ParseFileError::ReadLine {
+            path: path.clone(),
+            line_number,
+            source,
+        })?;
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        return Ok(trimmed.starts_with('{'));
+    }
+
+    Ok(false)
 }
 
 /// Parser for lines shaped as: timestamp level source message.
@@ -200,6 +265,7 @@ fn required_field(value: Option<String>, field: &'static str) -> ParseResult<Str
 mod tests {
     use super::{
         JsonLineLogParser, LogParser, ParseError, ParseFileError, PlainTextLogParser, parse_file,
+        parse_file_auto, parse_file_auto_with, parse_file_with,
     };
     use crate::model::LogLevel;
     use chrono::{TimeZone, Utc};
@@ -349,6 +415,64 @@ mod tests {
         fs::remove_file(path).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].source.name, "api");
+    }
+
+    #[test]
+    fn streams_parsed_entries_without_returning_collection() {
+        let path = write_temp_log(
+            "2026-06-12T10:00:00Z INFO api started\n2026-06-12T10:01:00Z ERROR api failed\n",
+        );
+        let mut levels = Vec::new();
+
+        parse_file_with(&path, &PlainTextLogParser, |entry| {
+            levels.push(entry.level);
+        })
+        .unwrap();
+
+        fs::remove_file(path).unwrap();
+        assert_eq!(levels, vec![LogLevel::Info, LogLevel::Error]);
+    }
+
+    #[test]
+    fn auto_parser_detects_json_content_with_log_extension() {
+        let path = write_temp_log(
+            r#"{"timestamp":"2026-06-12T10:00:00Z","level":"INFO","source":"api","message":"started"}
+"#,
+        );
+
+        let entries = parse_file_auto(&path).unwrap();
+
+        fs::remove_file(path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source.name, "api");
+    }
+
+    #[test]
+    fn auto_parser_keeps_plain_text_logs_as_text() {
+        let path = write_temp_log("2026-06-12T10:00:00Z WARN api retrying\n");
+
+        let entries = parse_file_auto(&path).unwrap();
+
+        fs::remove_file(path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].level, LogLevel::Warn);
+    }
+
+    #[test]
+    fn auto_parser_streams_json_logs() {
+        let path = write_temp_log(
+            r#"{"timestamp":"2026-06-12T10:00:00Z","level":"WARN","source":"api","message":"retrying"}
+"#,
+        );
+        let mut sources = Vec::new();
+
+        parse_file_auto_with(&path, |entry| {
+            sources.push(entry.source.name);
+        })
+        .unwrap();
+
+        fs::remove_file(path).unwrap();
+        assert_eq!(sources, vec!["api"]);
     }
 
     #[test]

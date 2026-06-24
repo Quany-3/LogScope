@@ -1,17 +1,19 @@
 use crate::analyzer::{BasicAnalyzer, OperationalInsights, RealtimeSummary};
-use crate::model::{LogEntry, LogTimestamp, ReportMetadata};
-use crate::parser::{JsonLineLogParser, PlainTextLogParser, parse_file};
+use crate::model::{LogEntry, LogLevel, LogTimestamp, ReportMetadata};
+use crate::parser::parse_file_auto_with;
 use crate::report::{
-    MarkdownReportWriter, Report, ReportPreview, ReportSectionBuilder, build_insight_section,
-    build_report_preview,
+    HtmlReportWriter, MarkdownReportWriter, Report, ReportPreview, ReportSectionBuilder,
+    ReportWriter, build_diagnostic_section, build_insight_section, build_report_preview,
 };
+use crate::utils::write_file_safely;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use crossterm::event::{KeyCode, KeyEvent};
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+
+const LARGE_LOG_FILE_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Runtime state shared by the TUI renderer and keyboard event loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,7 +21,12 @@ pub struct App {
     running: bool,
     source_label: String,
     entries: Vec<LogEntry>,
-    selected_index: Option<usize>,
+    filtered_indices: Vec<usize>,
+    selected_filtered_index: Option<usize>,
+    log_offset: usize,
+    filters: LogFilters,
+    search_input: Option<String>,
+    quit_pending: bool,
     summary: RealtimeSummary,
     insights: Option<OperationalInsights>,
     report_preview: ReportPreview,
@@ -37,13 +44,19 @@ impl App {
         let report_preview = build_report_preview(&report, &MarkdownReportWriter, 12)
             .context("failed to build TUI report preview")?;
         let status_message = format!("Loaded {} entries from {source_label}", entries.len());
-        let selected_index = (!entries.is_empty()).then_some(0);
+        let filtered_indices = (0..entries.len()).collect::<Vec<_>>();
+        let selected_filtered_index = (!filtered_indices.is_empty()).then_some(0);
 
         Ok(Self {
             running: true,
             source_label,
             entries,
-            selected_index,
+            filtered_indices,
+            selected_filtered_index,
+            log_offset: 0,
+            filters: LogFilters::default(),
+            search_input: None,
+            quit_pending: false,
             summary,
             insights: Some(insights),
             report_preview,
@@ -69,11 +82,37 @@ impl App {
     }
 
     pub fn selected_index(&self) -> Option<usize> {
-        self.selected_index
+        self.selected_entry_index()
+    }
+
+    pub fn log_offset(&self) -> usize {
+        self.log_offset
     }
 
     pub(crate) fn entries(&self) -> &[LogEntry] {
         &self.entries
+    }
+
+    pub(crate) fn visible_log_entries(&self, max_rows: usize) -> Vec<(usize, &LogEntry)> {
+        if max_rows == 0 {
+            return Vec::new();
+        }
+
+        let offset = self.visible_log_offset(max_rows);
+        self.filtered_indices
+            .iter()
+            .skip(offset)
+            .take(max_rows)
+            .copied()
+            .filter_map(|index| self.entries.get(index).map(|entry| (index, entry)))
+            .collect()
+    }
+
+    pub fn filter_label(&self) -> String {
+        if let Some(search_input) = &self.search_input {
+            return format!("searching: {search_input}");
+        }
+        self.filters.label()
     }
 
     pub fn is_file_picker_open(&self) -> bool {
@@ -86,6 +125,7 @@ impl App {
             files,
             selected_index: 0,
             marked_indices: BTreeSet::new(),
+            current_dir: None,
         };
         if self.file_picker.files.is_empty() {
             self.status_message = "No log files found.".to_string();
@@ -95,12 +135,28 @@ impl App {
         }
     }
 
+    pub fn open_file_picker_at(&mut self, directory: PathBuf) {
+        self.file_picker = FilePickerState {
+            open: true,
+            files: discover_file_picker_entries(&directory),
+            selected_index: 0,
+            marked_indices: BTreeSet::new(),
+            current_dir: Some(directory.clone()),
+        };
+        if self.file_picker.files.is_empty() {
+            self.status_message =
+                format!("No log files or directories in {}.", directory.display());
+        } else {
+            self.status_message = format!("Browsing {}.", directory.display());
+        }
+    }
+
     pub fn file_picker_lines(&self) -> Vec<String> {
         if !self.file_picker.open {
             return Vec::new();
         }
         if self.file_picker.files.is_empty() {
-            return vec!["No .log, .json, or .jsonl files found.".to_string()];
+            return vec!["No directories, .log, .json, or .jsonl files found.".to_string()];
         }
 
         self.file_picker
@@ -113,7 +169,9 @@ impl App {
                 } else {
                     " "
                 };
-                let checked = if self.file_picker.marked_indices.contains(&index) {
+                let checked = if path.is_dir() {
+                    "[dir]"
+                } else if self.file_picker.marked_indices.contains(&index) {
                     "[x]"
                 } else {
                     "[ ]"
@@ -124,34 +182,48 @@ impl App {
     }
 
     pub fn log_lines(&self) -> Vec<String> {
-        if self.entries.is_empty() {
+        if self.filtered_indices.is_empty() {
             return vec!["No log file loaded.".to_string()];
         }
 
-        self.entries
+        self.filtered_indices
             .iter()
+            .skip(self.log_offset)
             .take(20)
+            .filter_map(|index| self.entries.get(*index))
             .map(LogEntry::display_line)
             .collect()
     }
 
     pub fn summary_lines(&self) -> Vec<String> {
+        let filtered_entries = self.filtered_entries();
+        let analyzer = BasicAnalyzer;
+        let summary = analyzer.realtime_summary(&filtered_entries, 10);
+        let insights = analyzer.build_insights(&filtered_entries, 60, 1_000, 5);
         let mut lines = vec![
-            format!("Total: {}", self.summary.total_count),
-            format!("Warnings: {}", self.summary.warning_count),
-            format!("Errors: {}", self.summary.error_count),
+            format!("Total: {}", summary.total_count),
+            format!("Warnings: {}", summary.warning_count),
+            format!("Errors: {}", summary.error_count),
+            format!("Filter: {}", self.filter_label()),
         ];
 
-        if let Some(insights) = &self.insights {
-            lines.push(format!("Severity: {}/100", insights.severity_score));
-            lines.push(format!("Error rate: {}%", insights.error_rate_percent));
-            lines.push(format!("Slow rate: {}%", insights.slow_rate_percent));
+        lines.push(format!("Severity: {}/100", insights.severity_score));
+        lines.push(format!("Error rate: {}%", insights.error_rate_percent));
+        lines.push(format!("Slow rate: {}%", insights.slow_rate_percent));
+        if !insights.file_activity.is_empty() {
+            lines.push("Top files:".to_string());
+            lines.extend(insights.file_activity.iter().take(3).map(|file| {
+                format!(
+                    "{}: severity {}/100, errors {}/{}",
+                    file.path, file.severity_score, file.error_count, file.total_count
+                )
+            }));
         }
 
-        if !self.summary.top_sources.is_empty() {
+        if !summary.top_sources.is_empty() {
             lines.push("Top sources:".to_string());
             lines.extend(
-                self.summary
+                summary
                     .top_sources
                     .iter()
                     .map(|ranking| format!("{}: {}", ranking.source, ranking.count)),
@@ -162,7 +234,7 @@ impl App {
     }
 
     pub fn selected_entry_details(&self) -> Vec<String> {
-        let Some(index) = self.selected_index else {
+        let Some(index) = self.selected_entry_index() else {
             return vec!["No entry selected.".to_string()];
         };
         let Some(entry) = self.entries.get(index) else {
@@ -185,6 +257,22 @@ impl App {
         &self.status_message
     }
 
+    pub fn hint_line(&self) -> String {
+        if let Some(input) = &self.search_input {
+            return format!("Search: {input}_ | Enter apply | Esc cancel | Backspace delete");
+        }
+        if self.quit_pending {
+            return "Quit confirmation: press q/Esc again to exit, any other key cancels."
+                .to_string();
+        }
+        if self.file_picker.open {
+            return "File picker: Enter open/load | Space mark file | Backspace parent | Esc close"
+                .to_string();
+        }
+        "Keys: / search | e ERROR+ | w WARN+ | c clear | o open | r export HTML | q/Esc quit"
+            .to_string()
+    }
+
     pub fn report_preview_lines(&self) -> Vec<String> {
         if self.report_preview.lines.is_empty() {
             return vec!["No report preview available.".to_string()];
@@ -201,31 +289,180 @@ impl App {
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) {
+        if self.handle_search_key_event(key) {
+            return;
+        }
+
+        if self.quit_pending && !matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+            self.cancel_quit_confirmation();
+        }
+
         match key.code {
             KeyCode::Esc if self.file_picker.open => self.file_picker.open = false,
-            KeyCode::Char('q') | KeyCode::Esc => self.running = false,
+            KeyCode::Char('q') | KeyCode::Esc => self.confirm_or_request_quit(),
             KeyCode::Char('o') => self.open_file_picker(),
+            KeyCode::Char('/') => self.start_search(),
+            KeyCode::Char('e') => self.set_min_level_filter(Some(LogLevel::Error)),
+            KeyCode::Char('w') => self.set_min_level_filter(Some(LogLevel::Warn)),
+            KeyCode::Char('c') => self.clear_filters(),
+            KeyCode::Char('r') => self.export_html_report(),
             KeyCode::Char(' ') if self.file_picker.open => self.toggle_file_picker_mark(),
-            KeyCode::Enter if self.file_picker.open => self.load_marked_files(),
+            KeyCode::Enter if self.file_picker.open => self.activate_file_picker_selection(),
+            KeyCode::Backspace if self.file_picker.open => self.open_parent_directory(),
             KeyCode::Down if self.file_picker.open => self.move_file_picker(1),
             KeyCode::Up if self.file_picker.open => self.move_file_picker(-1),
             KeyCode::Down => self.move_selection(1),
             KeyCode::Up => self.move_selection(-1),
-            _ => {}
+            _ => self.cancel_quit_confirmation(),
+        }
+    }
+
+    fn confirm_or_request_quit(&mut self) {
+        if self.quit_pending {
+            self.running = false;
+        } else {
+            self.quit_pending = true;
+            self.status_message = "Press q again to quit.".to_string();
+        }
+    }
+
+    fn cancel_quit_confirmation(&mut self) {
+        if self.quit_pending {
+            self.quit_pending = false;
+            self.status_message = "Quit cancelled.".to_string();
         }
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let Some(current) = self.selected_index else {
+        let Some(current) = self.selected_filtered_index else {
             return;
         };
-        let last = self.entries.len().saturating_sub(1);
+        let last = self.filtered_indices.len().saturating_sub(1);
         let next = current.saturating_add_signed(delta).min(last);
-        self.selected_index = Some(next);
+        self.selected_filtered_index = Some(next);
+        self.keep_selected_log_visible(20);
+    }
+
+    fn visible_log_offset(&self, max_rows: usize) -> usize {
+        let Some(selected_index) = self.selected_filtered_index else {
+            return self.log_offset;
+        };
+        if self.filtered_indices.len() <= max_rows {
+            return 0;
+        }
+        if selected_index < self.log_offset {
+            return selected_index;
+        }
+        if selected_index >= self.log_offset + max_rows {
+            return selected_index + 1 - max_rows;
+        }
+        self.log_offset
+    }
+
+    fn keep_selected_log_visible(&mut self, max_rows: usize) {
+        self.log_offset = self.visible_log_offset(max_rows);
+    }
+
+    fn selected_entry_index(&self) -> Option<usize> {
+        self.selected_filtered_index
+            .and_then(|index| self.filtered_indices.get(index).copied())
+    }
+
+    fn filtered_entries(&self) -> Vec<LogEntry> {
+        self.filtered_indices
+            .iter()
+            .filter_map(|index| self.entries.get(*index).cloned())
+            .collect()
+    }
+
+    fn start_search(&mut self) {
+        self.quit_pending = false;
+        self.search_input = Some(String::new());
+        self.status_message = "Search logs: type keyword, Enter apply, Esc cancel.".to_string();
+    }
+
+    fn handle_search_key_event(&mut self, key: KeyEvent) -> bool {
+        let Some(input) = self.search_input.as_mut() else {
+            return false;
+        };
+
+        match key.code {
+            KeyCode::Enter => {
+                let keyword = input.trim().to_string();
+                self.search_input = None;
+                self.filters.keyword = (!keyword.is_empty()).then_some(keyword);
+                self.apply_filters();
+            }
+            KeyCode::Esc => {
+                self.search_input = None;
+                self.status_message = "Search cancelled.".to_string();
+            }
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Char(character) => {
+                input.push(character);
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn set_min_level_filter(&mut self, min_level: Option<LogLevel>) {
+        self.filters.min_level = min_level;
+        self.apply_filters();
+    }
+
+    fn clear_filters(&mut self) {
+        self.filters = LogFilters::default();
+        self.search_input = None;
+        self.apply_filters();
+    }
+
+    fn apply_filters(&mut self) {
+        self.filtered_indices = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| self.filters.matches(entry).then_some(index))
+            .collect();
+        self.selected_filtered_index = (!self.filtered_indices.is_empty()).then_some(0);
+        self.log_offset = 0;
+        self.status_message = format!(
+            "{} of {} entries visible.",
+            self.filtered_indices.len(),
+            self.entries.len()
+        );
+    }
+
+    fn export_html_report(&mut self) {
+        if self.entries.is_empty() {
+            self.status_message = "No log entries to export.".to_string();
+            return;
+        }
+
+        let analyzer = BasicAnalyzer;
+        let insights = analyzer.build_insights(&self.entries, 60, 1_000, 5);
+        let report = build_tui_report(&self.source_label, &self.entries, &insights);
+        match HtmlReportWriter
+            .write(&report)
+            .context("failed to render HTML report")
+            .and_then(|content| {
+                write_file_safely("logscope-tui-report.html", &content)
+                    .context("failed to write HTML report")
+            }) {
+            Ok(()) => {
+                self.status_message =
+                    "Exported HTML report to logscope-tui-report.html.".to_string();
+            }
+            Err(error) => {
+                self.status_message = format!("Failed to export HTML report: {error}");
+            }
+        }
     }
 
     fn open_file_picker(&mut self) {
-        self.open_file_picker_with(discover_log_files());
+        self.open_file_picker_at(PathBuf::from("."));
     }
 
     fn move_file_picker(&mut self, delta: isize) {
@@ -246,6 +483,16 @@ impl App {
         }
 
         let index = self.file_picker.selected_index;
+        if self
+            .file_picker
+            .files
+            .get(index)
+            .is_some_and(|path| path.is_dir())
+        {
+            self.status_message = "Directories cannot be selected.".to_string();
+            return;
+        }
+
         if !self.file_picker.marked_indices.remove(&index) {
             self.file_picker.marked_indices.insert(index);
         }
@@ -253,16 +500,53 @@ impl App {
         self.status_message = format!("{count} file(s) selected. Press Enter to load.");
     }
 
+    fn activate_file_picker_selection(&mut self) {
+        let Some(path) = self
+            .file_picker
+            .files
+            .get(self.file_picker.selected_index)
+            .cloned()
+        else {
+            return;
+        };
+
+        if path.is_dir() {
+            self.open_file_picker_at(path);
+        } else {
+            self.load_marked_files();
+        }
+    }
+
+    fn open_parent_directory(&mut self) {
+        let Some(current_dir) = self.file_picker.current_dir.as_ref() else {
+            return;
+        };
+        let Some(parent) = current_dir.parent() else {
+            return;
+        };
+
+        self.open_file_picker_at(parent.to_path_buf());
+    }
+
     fn load_marked_files(&mut self) {
         let paths = self.selected_file_picker_paths();
         if paths.is_empty() {
             return;
         }
+        let has_large_file = has_large_log_file(&paths);
 
         match parse_log_files(&paths)
             .and_then(|entries| Self::from_entries(source_label_for_paths(&paths), entries))
         {
-            Ok(next) => *self = next,
+            Ok(mut next) => {
+                if has_large_file {
+                    next.status_message = format!(
+                        "Loaded {} entries from large log input; rendering uses a scroll window.",
+                        next.entries.len()
+                    );
+                }
+                *self = next;
+            }
             Err(error) => self.status_message = format!("Failed to load selected file(s): {error}"),
         }
     }
@@ -281,7 +565,9 @@ impl App {
         self.file_picker
             .marked_indices
             .iter()
-            .filter_map(|index| self.file_picker.files.get(*index).cloned())
+            .filter_map(|index| self.file_picker.files.get(*index))
+            .filter(|path| path.is_file())
+            .cloned()
             .collect()
     }
 }
@@ -292,7 +578,12 @@ impl Default for App {
             running: true,
             source_label: "No file".to_string(),
             entries: Vec::new(),
-            selected_index: None,
+            filtered_indices: Vec::new(),
+            selected_filtered_index: None,
+            log_offset: 0,
+            filters: LogFilters::default(),
+            search_input: None,
+            quit_pending: false,
             summary: RealtimeSummary::default(),
             insights: None,
             report_preview: ReportPreview::default(),
@@ -303,27 +594,79 @@ impl Default for App {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LogFilters {
+    min_level: Option<LogLevel>,
+    keyword: Option<String>,
+}
+
+impl LogFilters {
+    fn matches(&self, entry: &LogEntry) -> bool {
+        if let Some(min_level) = self.min_level
+            && !level_at_least(entry.level, min_level)
+        {
+            return false;
+        }
+        if let Some(keyword) = &self.keyword {
+            let keyword = keyword.to_ascii_lowercase();
+            let raw = entry.raw.to_ascii_lowercase();
+            let message = entry.message.to_ascii_lowercase();
+            if !raw.contains(&keyword) && !message.contains(&keyword) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn label(&self) -> String {
+        match (self.min_level, self.keyword.as_deref()) {
+            (Some(LogLevel::Error), Some(keyword)) => format!("ERROR+ search: {keyword}"),
+            (Some(LogLevel::Warn), Some(keyword)) => format!("WARN+ search: {keyword}"),
+            (_, Some(keyword)) => format!("search: {keyword}"),
+            (Some(LogLevel::Error), None) => "ERROR+".to_string(),
+            (Some(LogLevel::Warn), None) => "WARN+".to_string(),
+            _ => "All".to_string(),
+        }
+    }
+}
+
+fn level_at_least(level: LogLevel, min_level: LogLevel) -> bool {
+    level_rank(level) >= level_rank(min_level)
+}
+
+fn level_rank(level: LogLevel) -> u8 {
+    match level {
+        LogLevel::Trace => 0,
+        LogLevel::Debug => 1,
+        LogLevel::Info => 2,
+        LogLevel::Warn => 3,
+        LogLevel::Error => 4,
+        LogLevel::Fatal => 5,
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct FilePickerState {
     open: bool,
     files: Vec<PathBuf>,
     selected_index: usize,
     marked_indices: BTreeSet<usize>,
+    current_dir: Option<PathBuf>,
 }
 
-fn discover_log_files() -> Vec<PathBuf> {
+fn discover_file_picker_entries(directory: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    for directory in [Path::new("samples"), Path::new(".")] {
-        let Ok(entries) = fs::read_dir(directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() && is_supported_log_file(&path) {
-                files.push(path);
-            }
+    let Ok(entries) = fs::read_dir(directory) else {
+        return files;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() || (path.is_file() && is_supported_log_file(&path)) {
+            files.push(path);
         }
     }
-    files.sort();
+    // Directories first keeps navigation predictable in mixed folders.
+    files.sort_by_key(|path| (!path.is_dir(), path.display().to_string()));
     files.dedup();
     files
 }
@@ -336,16 +679,13 @@ fn is_supported_log_file(path: &Path) -> bool {
 }
 
 fn parse_log_file(path: &Path) -> Result<Vec<LogEntry>> {
-    let mut entries = if should_parse_as_json(path)? {
-        parse_file(path, &JsonLineLogParser)?
-    } else {
-        parse_file(path, &PlainTextLogParser)?
-    };
-    for entry in &mut entries {
+    let mut entries = Vec::new();
+    parse_file_auto_with(path, |mut entry| {
         entry
             .fields
             .insert("origin_file".to_string(), path.display().to_string());
-    }
+        entries.push(entry);
+    })?;
     entries.sort_by_key(|entry| entry.timestamp.value);
     Ok(entries)
 }
@@ -370,26 +710,16 @@ fn source_label_for_paths(paths: &[PathBuf]) -> String {
         .join(", ")
 }
 
-fn should_parse_as_json(path: &Path) -> Result<bool> {
-    if matches!(
-        path.extension().and_then(|extension| extension.to_str()),
-        Some("json" | "jsonl")
-    ) {
-        return Ok(true);
-    }
+fn has_large_log_file(paths: &[PathBuf]) -> bool {
+    paths
+        .iter()
+        .any(|path| is_large_log_file_with_threshold(path, LARGE_LOG_FILE_BYTES))
+}
 
-    let file = fs::File::open(path)
-        .with_context(|| format!("failed to inspect log file {}", path.display()))?;
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() {
-            continue;
-        }
-        return Ok(trimmed.starts_with('{'));
-    }
-
-    Ok(false)
+fn is_large_log_file_with_threshold(path: &Path, threshold: u64) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.len() >= threshold)
+        .unwrap_or(false)
 }
 
 fn build_tui_report(
@@ -412,7 +742,11 @@ fn build_tui_report(
             entry_count: entries.len(),
         }),
         summary: summary.basic,
-        sections: vec![build_insight_section(insights), source_section.build()],
+        sections: vec![
+            build_diagnostic_section(insights),
+            build_insight_section(insights),
+            source_section.build(),
+        ],
     }
 }
 
@@ -423,6 +757,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::fs;
+    use std::fs::OpenOptions;
 
     #[test]
     fn builds_display_state_from_loaded_entries() {
@@ -486,6 +821,20 @@ mod tests {
     }
 
     #[test]
+    fn log_window_follows_selected_entry() {
+        let mut app = App::from_entries("sample.log", numbered_entries(25)).unwrap();
+
+        for _ in 0..24 {
+            app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+
+        assert_eq!(app.selected_index(), Some(24));
+        assert_eq!(app.log_offset(), 5);
+        assert_eq!(app.visible_log_entries(20)[0].0, 5);
+        assert_eq!(app.visible_log_entries(20)[19].0, 24);
+    }
+
+    #[test]
     fn selected_entry_details_include_structured_fields() {
         let app = App::from_entries("sample.log", sample_entries()).unwrap();
         let details = app.selected_entry_details();
@@ -495,10 +844,133 @@ mod tests {
     }
 
     #[test]
+    fn summary_lines_include_file_activity() {
+        let mut entries = sample_entries();
+        entries[0]
+            .fields
+            .insert("origin_file".to_string(), "api.log".to_string());
+        entries[1]
+            .fields
+            .insert("origin_file".to_string(), "worker.log".to_string());
+        let app = App::from_entries("api.log, worker.log", entries).unwrap();
+
+        assert!(app.summary_lines().contains(&"Top files:".to_string()));
+        assert!(
+            app.summary_lines()
+                .iter()
+                .any(|line| line == "api.log: severity 100/100, errors 1/1")
+        );
+    }
+
+    #[test]
+    fn detects_large_log_files_by_size_threshold() {
+        let path = write_temp_log("2026-06-12T10:00:00Z INFO api started\n");
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(128)
+            .unwrap();
+
+        assert!(super::is_large_log_file_with_threshold(&path, 64));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn filters_logs_by_error_and_warning_level() {
+        let mut app = App::from_entries("sample.log", mixed_level_entries()).unwrap();
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert_eq!(app.filter_label(), "ERROR+");
+        assert_eq!(app.summary_lines()[0], "Total: 2");
+        assert!(
+            app.log_lines()
+                .iter()
+                .all(|line| line.contains("ERROR") || line.contains("FATAL"))
+        );
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert_eq!(app.filter_label(), "WARN+");
+        assert_eq!(app.summary_lines()[0], "Total: 3");
+        assert!(
+            app.log_lines().iter().all(|line| line.contains("WARN")
+                || line.contains("ERROR")
+                || line.contains("FATAL"))
+        );
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(app.filter_label(), "All");
+        assert_eq!(app.summary_lines()[0], "Total: 4");
+    }
+
+    #[test]
+    fn filters_logs_by_search_keyword() {
+        let mut app = App::from_entries("sample.log", mixed_level_entries()).unwrap();
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.filter_label(), "search: timeout");
+        assert_eq!(app.summary_lines()[0], "Total: 1");
+        assert_eq!(app.selected_entry_details()[3], "Message: database timeout");
+    }
+
+    #[test]
+    fn shows_search_input_hint_while_typing() {
+        let mut app = App::from_entries("sample.log", mixed_level_entries()).unwrap();
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+
+        assert_eq!(
+            app.hint_line(),
+            "Search: db_ | Enter apply | Esc cancel | Backspace delete"
+        );
+        assert_eq!(app.filter_label(), "searching: db");
+    }
+
+    #[test]
+    fn quit_requires_confirmation() {
+        let mut app = App::default();
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.is_running());
+        assert_eq!(app.status_line(), "Press q again to quit.");
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.is_running());
+    }
+
+    #[test]
+    fn non_quit_key_cancels_quit_confirmation() {
+        let mut app = App::default();
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+
+        assert!(app.is_running());
+        assert_eq!(
+            app.hint_line(),
+            "Search: _ | Enter apply | Esc cancel | Backspace delete"
+        );
+    }
+
+    #[test]
     fn quit_keys_stop_the_application() {
         for key_code in [KeyCode::Char('q'), KeyCode::Esc] {
             let mut app = App::default();
 
+            app.handle_key_event(KeyEvent::new(key_code, KeyModifiers::NONE));
+            assert!(app.is_running());
             app.handle_key_event(KeyEvent::new(key_code, KeyModifiers::NONE));
 
             assert!(!app.is_running());
@@ -562,6 +1034,58 @@ mod tests {
     }
 
     #[test]
+    fn file_picker_enters_directories_and_returns_to_parent() {
+        let root = write_temp_dir();
+        let nested = root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(
+            nested.join("worker.log"),
+            "2026-06-12T10:00:00Z INFO worker started\n",
+        )
+        .unwrap();
+        let mut app = App::default();
+
+        app.open_file_picker_at(root.clone());
+        assert_eq!(
+            app.file_picker_lines(),
+            vec![format!("> [dir] {}", nested.display())]
+        );
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.file_picker_lines(),
+            vec![format!("> [ ] {}", nested.join("worker.log").display())]
+        );
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(
+            app.file_picker_lines(),
+            vec![format!("> [dir] {}", nested.display())]
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_picker_marks_only_log_files_not_directories() {
+        let root = write_temp_dir();
+        let nested = root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let mut app = App::default();
+
+        app.open_file_picker_at(root.clone());
+        app.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+
+        assert_eq!(
+            app.file_picker_lines(),
+            vec![format!("> [dir] {}", nested.display())]
+        );
+        assert_eq!(app.status_line(), "Directories cannot be selected.");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn file_picker_detects_json_content_with_log_extension() {
         let path = write_temp_log(
             "{\"timestamp\":\"2026-06-12T10:00:00Z\",\"level\":\"INFO\",\"source\":\"api\",\"message\":\"service started\"}\n",
@@ -575,6 +1099,22 @@ mod tests {
         assert!(!app.is_file_picker_open());
         assert_eq!(app.summary().total_count, 1);
         assert_eq!(app.selected_entry_details()[1], "Level: INFO");
+    }
+
+    #[test]
+    fn exports_html_report_from_tui_shortcut() {
+        let root = write_temp_dir();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+        let mut app = App::from_entries("sample.log", sample_entries()).unwrap();
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+
+        let output = fs::read_to_string(root.join("logscope-tui-report.html")).unwrap();
+        std::env::set_current_dir(original_dir).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert!(output.contains("<!doctype html>"));
+        assert!(app.status_line().contains("Exported HTML report"));
     }
 
     fn sample_entries() -> Vec<LogEntry> {
@@ -602,6 +1142,21 @@ mod tests {
         }
     }
 
+    fn numbered_entries(count: usize) -> Vec<LogEntry> {
+        (0..count)
+            .map(|index| sample_entry(LogLevel::Info, &format!("entry={index}"), index as u32))
+            .collect()
+    }
+
+    fn mixed_level_entries() -> Vec<LogEntry> {
+        vec![
+            sample_entry(LogLevel::Info, "started", 1),
+            sample_entry(LogLevel::Warn, "retrying", 2),
+            sample_entry(LogLevel::Error, "database timeout", 3),
+            sample_entry(LogLevel::Fatal, "worker crashed", 4),
+        ]
+    }
+
     fn write_temp_log(content: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "logscope-picker-{}.log",
@@ -611,6 +1166,18 @@ mod tests {
                 .as_nanos()
         ));
         fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn write_temp_dir() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "logscope-picker-dir-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
         path
     }
 }

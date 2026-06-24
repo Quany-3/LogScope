@@ -1,11 +1,21 @@
 pub const MODULE_NAME: &str = "report";
 
-use crate::analyzer::{AnalysisResult, OperationalInsights};
-use crate::model::{LogLevel, ReportMetadata};
+mod html;
+mod json;
+mod markdown;
+mod sections;
+
+pub use html::HtmlReportWriter;
+pub use json::JsonReportWriter;
+pub use markdown::MarkdownReportWriter;
+pub use sections::{ReportSectionBuilder, build_diagnostic_section, build_insight_section};
+
+use crate::analyzer::AnalysisResult;
+use crate::model::ReportMetadata;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// In-memory report payload before it is rendered as Markdown or JSON.
+/// In-memory report payload before it is rendered by a concrete writer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Report {
     pub title: String,
@@ -44,60 +54,6 @@ pub trait ReportWriter {
     fn write(&self, report: &Report) -> ReportResult<String>;
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct MarkdownReportWriter;
-
-impl ReportWriter for MarkdownReportWriter {
-    fn write(&self, report: &Report) -> ReportResult<String> {
-        let mut output = format!(
-            "# {}\n\nTotal entries: {}\n\n## Level counts\n",
-            report.title, report.summary.total_count
-        );
-
-        if let Some(metadata) = &report.metadata {
-            output.push_str(&format!(
-                "\nSource: {}\nGenerated at: {}\n",
-                metadata.source, metadata.generated_at.value
-            ));
-        }
-
-        for level in [
-            LogLevel::Trace,
-            LogLevel::Debug,
-            LogLevel::Info,
-            LogLevel::Warn,
-            LogLevel::Error,
-            LogLevel::Fatal,
-        ] {
-            if let Some(count) = report.summary.level_counts.get(&level) {
-                output.push_str(&format!("- {}: {count}\n", level.as_str()));
-            }
-        }
-
-        output.push_str("\n## Source counts\n");
-        let mut sources = report.summary.source_counts.iter().collect::<Vec<_>>();
-        sources.sort_by_key(|(source, _)| *source);
-        for (source, count) in sources {
-            output.push_str(&format!("- {source}: {count}\n"));
-        }
-
-        for section in &report.sections {
-            output.push_str(&format!("\n## {}\n{}\n", section.heading, section.body));
-        }
-
-        Ok(output.trim_end().to_string())
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct JsonReportWriter;
-
-impl ReportWriter for JsonReportWriter {
-    fn write(&self, report: &Report) -> ReportResult<String> {
-        Ok(serde_json::to_string_pretty(report)?)
-    }
-}
-
 /// Rendered report excerpt that can be displayed without loading a full report view.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReportPreview {
@@ -123,68 +79,11 @@ pub fn build_report_preview(
     })
 }
 
-pub fn build_insight_section(insights: &OperationalInsights) -> ReportSection {
-    let mut builder = ReportSectionBuilder::new("Operational Insights")
-        .line(format!("Severity score: {}/100", insights.severity_score))
-        .line(format!("Error rate: {}%", insights.error_rate_percent))
-        .line(format!(
-            "Slow request rate: {}%",
-            insights.slow_rate_percent
-        ));
-
-    if let Some(window) = &insights.peak_window {
-        builder = builder.line(format!(
-            "Peak window: {} to {} ({} entries, {} errors, {} warnings)",
-            window.start, window.end, window.entry_count, window.error_count, window.warning_count
-        ));
-    }
-
-    if !insights.correlations.is_empty() {
-        builder = builder.line("Correlated activity:");
-        for group in &insights.correlations {
-            builder = builder.line(format!(
-                "{}: {} entries, {} errors, sources={}",
-                group.key,
-                group.entry_count,
-                group.error_count,
-                group.sources.join(",")
-            ));
-        }
-    }
-
-    builder.build()
-}
-
-/// Small fluent builder for assembling multi-line report sections.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReportSectionBuilder {
-    heading: String,
-    lines: Vec<String>,
-}
-
-impl ReportSectionBuilder {
-    pub fn new(heading: impl Into<String>) -> Self {
-        Self {
-            heading: heading.into(),
-            lines: Vec::new(),
-        }
-    }
-
-    pub fn line(mut self, line: impl Into<String>) -> Self {
-        self.lines.push(line.into());
-        self
-    }
-
-    pub fn build(self) -> ReportSection {
-        ReportSection::new(self.heading, self.lines.join("\n"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        JsonReportWriter, MarkdownReportWriter, Report, ReportSection, ReportSectionBuilder,
-        ReportWriter,
+        HtmlReportWriter, JsonReportWriter, MarkdownReportWriter, Report, ReportSection,
+        ReportSectionBuilder, ReportWriter,
     };
     use crate::analyzer::AnalysisResult;
     use crate::model::LogLevel;
@@ -238,6 +137,19 @@ mod tests {
     }
 
     #[test]
+    fn writes_html_report_with_visual_sections() {
+        let report = sample_report();
+        let output = render_report(&HtmlReportWriter, &report);
+
+        assert!(output.starts_with("<!doctype html>"));
+        assert!(output.contains("<title>Daily LogScope Report</title>"));
+        assert!(output.contains("class=\"metric\""));
+        assert!(output.contains("Level Distribution"));
+        assert!(output.contains("Source Distribution"));
+        assert!(output.contains("Notes"));
+    }
+
+    #[test]
     fn builds_limited_report_preview_for_tui() {
         let report = sample_report();
         let preview = super::build_report_preview(&report, &MarkdownReportWriter, 3).unwrap();
@@ -255,6 +167,16 @@ mod tests {
             error_rate_percent: 25,
             slow_rate_percent: 40,
             peak_window: None,
+            file_activity: vec![crate::analyzer::FileActivityInsight {
+                path: "worker.log".to_string(),
+                total_count: 4,
+                warning_count: 1,
+                error_count: 2,
+                fatal_count: 1,
+                slow_count: 2,
+                error_rate_percent: 50,
+                severity_score: 95,
+            }],
             correlations: vec![crate::analyzer::CorrelationInsight {
                 key: "request_id=req-42".to_string(),
                 entry_count: 3,
@@ -272,7 +194,58 @@ mod tests {
         assert!(
             section
                 .body
+                .contains("worker.log: severity 95/100, 4 entries, 2 errors, 1 fatal, 2 slow")
+        );
+        assert!(
+            section
+                .body
                 .contains("request_id=req-42: 3 entries, 2 errors")
+        );
+    }
+
+    #[test]
+    fn builds_diagnostic_finding_report_section() {
+        let insights = crate::analyzer::OperationalInsights {
+            severity_score: 92,
+            error_rate_percent: 40,
+            slow_rate_percent: 20,
+            peak_window: None,
+            file_activity: vec![crate::analyzer::FileActivityInsight {
+                path: "worker.log".to_string(),
+                total_count: 10,
+                warning_count: 1,
+                error_count: 6,
+                fatal_count: 1,
+                slow_count: 3,
+                error_rate_percent: 60,
+                severity_score: 100,
+            }],
+            correlations: vec![crate::analyzer::CorrelationInsight {
+                key: "job_id=job-77".to_string(),
+                entry_count: 4,
+                error_count: 3,
+                sources: vec!["worker".to_string()],
+                sample_messages: vec!["worker crashed".to_string()],
+            }],
+        };
+
+        let section = super::build_diagnostic_section(&insights);
+
+        assert_eq!(section.heading, "Diagnostic Findings");
+        assert!(
+            section
+                .body
+                .contains("Overall health is critical: severity 92/100 with 40% errors.")
+        );
+        assert!(
+            section
+                .body
+                .contains("Most affected file: worker.log has 6 errors across 10 entries.")
+        );
+        assert!(
+            section
+                .body
+                .contains("Correlated failures: job_id=job-77 links 4 entries and 3 errors.")
         );
     }
 

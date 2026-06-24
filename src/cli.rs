@@ -6,10 +6,10 @@ use crate::model::{
     ErrorPattern, FilterCondition, LogEntry, LogLevel, LogTimestamp, ReportExportFormat,
     ReportMetadata, SearchResult,
 };
-use crate::parser::{JsonLineLogParser, LogParser, PlainTextLogParser, parse_file};
+use crate::parser::{JsonLineLogParser, PlainTextLogParser, parse_file_auto_with, parse_file_with};
 use crate::report::{
-    JsonReportWriter, MarkdownReportWriter, Report, ReportSectionBuilder, ReportWriter,
-    build_insight_section,
+    HtmlReportWriter, JsonReportWriter, MarkdownReportWriter, Report, ReportSectionBuilder,
+    ReportWriter, build_diagnostic_section, build_insight_section,
 };
 use crate::utils::write_file_safely;
 use anyhow::{Context, Result};
@@ -113,6 +113,7 @@ pub struct TuiArgs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ParserKind {
+    Auto,
     Text,
     Json,
 }
@@ -252,6 +253,7 @@ fn execute_report(args: &ReportArgs) -> Result<PathBuf> {
         }),
         summary: summary.basic,
         sections: vec![
+            build_diagnostic_section(&insights),
             build_insight_section(&insights),
             source_section.build(),
             pattern_section.build(),
@@ -261,6 +263,7 @@ fn execute_report(args: &ReportArgs) -> Result<PathBuf> {
     let content = match format {
         ReportExportFormat::Markdown => MarkdownReportWriter.write(&report)?,
         ReportExportFormat::Json => JsonReportWriter.write(&report)?,
+        ReportExportFormat::Html => HtmlReportWriter.write(&report)?,
     };
     write_file_safely(&output, &content)?;
 
@@ -268,17 +271,15 @@ fn execute_report(args: &ReportArgs) -> Result<PathBuf> {
 }
 
 fn load_entries(options: &RuntimeOptions) -> Result<Vec<LogEntry>> {
-    let parser = parser_for(options.parser);
     let mut entries = Vec::new();
     for input in &options.inputs {
-        let mut parsed = parse_file(input, parser.as_ref())
-            .with_context(|| format!("failed to parse input file {}", input.display()))?;
-        for entry in &mut parsed {
+        parse_input_file_with(input, options.parser, |mut entry| {
             entry
                 .fields
                 .insert("origin_file".to_string(), input.display().to_string());
-        }
-        entries.extend(parsed);
+            entries.push(entry);
+        })
+        .with_context(|| format!("failed to parse input file {}", input.display()))?;
     }
     entries.sort_by_key(|entry| entry.timestamp.value);
 
@@ -359,10 +360,15 @@ pub fn format_analysis_summary(result: &AnalysisResult) -> String {
     summary.trim_end().to_string()
 }
 
-fn parser_for(parser: ParserKind) -> Box<dyn LogParser> {
+fn parse_input_file_with(
+    input: &PathBuf,
+    parser: ParserKind,
+    visitor: impl FnMut(LogEntry),
+) -> Result<()> {
     match parser {
-        ParserKind::Text => Box::new(PlainTextLogParser),
-        ParserKind::Json => Box::new(JsonLineLogParser),
+        ParserKind::Auto => Ok(parse_file_auto_with(input, visitor)?),
+        ParserKind::Text => Ok(parse_file_with(input, &PlainTextLogParser, visitor)?),
+        ParserKind::Json => Ok(parse_file_with(input, &JsonLineLogParser, visitor)?),
     }
 }
 
@@ -403,7 +409,7 @@ fn resolve_options(
     };
     let parser = parser
         .or_else(|| config.as_ref().map(|config| config.parser.into()))
-        .unwrap_or(ParserKind::Text);
+        .unwrap_or(ParserKind::Auto);
 
     Ok(RuntimeOptions { inputs, parser })
 }
@@ -426,6 +432,7 @@ fn parse_report_format(value: &str) -> std::result::Result<ReportExportFormat, S
     match value.to_ascii_lowercase().as_str() {
         "markdown" | "md" => Ok(ReportExportFormat::Markdown),
         "json" => Ok(ReportExportFormat::Json),
+        "html" => Ok(ReportExportFormat::Html),
         _ => Err(format!("unsupported report format: {value}")),
     }
 }
@@ -442,6 +449,7 @@ impl From<ParserFormat> for ParserKind {
 #[cfg(test)]
 mod tests {
     use super::{AnalysisResult, AnalyzeArgs, Cli, Command, CommandOutput, ParserKind, execute};
+    use crate::model::ReportExportFormat;
     use clap::Parser;
     use std::fs;
     use std::path::PathBuf;
@@ -525,6 +533,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_html_report_format_option() {
+        let cli = Cli::try_parse_from([
+            "logscope",
+            "report",
+            "--format",
+            "html",
+            "--output",
+            "report.html",
+            "logs/app.log",
+        ])
+        .unwrap();
+        let Command::Report(args) = &cli.command else {
+            panic!("expected report command");
+        };
+
+        assert_eq!(args.format, Some(ReportExportFormat::Html));
+    }
+
+    #[test]
+    fn parses_auto_parser_type_option() {
+        let cli = Cli::try_parse_from(["logscope", "analyze", "--parser", "auto", "logs/app.log"])
+            .unwrap();
+
+        assert_eq!(analyze_args(&cli).parser, Some(ParserKind::Auto));
+    }
+
+    #[test]
     fn parses_config_file_option_without_input_argument() {
         let cli =
             Cli::try_parse_from(["logscope", "analyze", "--config", "logscope.toml"]).unwrap();
@@ -562,6 +597,20 @@ mod tests {
         fs::remove_file(first).unwrap();
         fs::remove_file(second).unwrap();
         assert_eq!(analysis_result(&output).total_count, 2);
+    }
+
+    #[test]
+    fn defaults_to_auto_parser_for_json_content_in_log_file() {
+        let path = write_temp_file(
+            "log",
+            "{\"timestamp\":\"2026-06-12T10:00:00Z\",\"level\":\"INFO\",\"source\":\"api\",\"message\":\"started\"}\n",
+        );
+        let cli = analyze_cli(vec![path.clone()], None, None);
+
+        let output = execute(&cli).unwrap();
+
+        fs::remove_file(path).unwrap();
+        assert_eq!(analysis_result(&output).total_count, 1);
     }
 
     #[test]
