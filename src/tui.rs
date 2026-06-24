@@ -1,5 +1,7 @@
 pub const MODULE_NAME: &str = "tui";
 
+use crate::analyzer::RealtimeSummary;
+use crate::report::ReportPreview;
 use anyhow::{Context, Result};
 use crossterm::cursor::Show;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -20,11 +22,21 @@ use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct App {
     running: bool,
+    summary: RealtimeSummary,
+    report_preview: ReportPreview,
 }
 
 impl App {
     pub fn is_running(&self) -> bool {
         self.running
+    }
+
+    pub fn summary(&self) -> &RealtimeSummary {
+        &self.summary
+    }
+
+    pub fn report_preview(&self) -> &ReportPreview {
+        &self.report_preview
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) {
@@ -36,7 +48,11 @@ impl App {
 
 impl Default for App {
     fn default() -> Self {
-        Self { running: true }
+        Self {
+            running: true,
+            summary: RealtimeSummary::default(),
+            report_preview: ReportPreview::default(),
+        }
     }
 }
 
@@ -112,6 +128,17 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::App;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn initializes_application_state_for_tui_panels() {
+        let app = App::default();
+
+        assert!(app.is_running());
+        assert_eq!(app.summary().total_count, 0);
+        assert!(app.summary().recent_lines.is_empty());
+        assert!(app.report_preview().lines.is_empty());
+        assert!(!app.report_preview().truncated);
+    }
 
     #[test]
     fn quit_keys_stop_the_application() {

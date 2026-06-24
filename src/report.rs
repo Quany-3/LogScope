@@ -98,6 +98,31 @@ impl ReportWriter for JsonReportWriter {
     }
 }
 
+/// Rendered report excerpt that can be displayed without loading a full report view.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReportPreview {
+    pub lines: Vec<String>,
+    pub total_lines: usize,
+    pub truncated: bool,
+}
+
+pub fn build_report_preview(
+    report: &Report,
+    writer: &dyn ReportWriter,
+    max_lines: usize,
+) -> ReportResult<ReportPreview> {
+    let rendered = writer.write(report)?;
+    let lines = rendered.lines().map(str::to_string).collect::<Vec<_>>();
+    let total_lines = lines.len();
+    let truncated = total_lines > max_lines;
+
+    Ok(ReportPreview {
+        lines: lines.into_iter().take(max_lines).collect(),
+        total_lines,
+        truncated,
+    })
+}
+
 /// Small fluent builder for assembling multi-line report sections.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportSectionBuilder {
@@ -178,6 +203,17 @@ mod tests {
         assert_eq!(json["title"], "Daily LogScope Report");
         assert_eq!(json["summary"]["total_count"], 3);
         assert_eq!(json["sections"][0]["heading"], "Notes");
+    }
+
+    #[test]
+    fn builds_limited_report_preview_for_tui() {
+        let report = sample_report();
+        let preview = super::build_report_preview(&report, &MarkdownReportWriter, 3).unwrap();
+
+        assert_eq!(preview.lines.len(), 3);
+        assert_eq!(preview.total_lines, 14);
+        assert!(preview.truncated);
+        assert_eq!(preview.lines[0], "# Daily LogScope Report");
     }
 
     fn render_report(writer: &dyn ReportWriter, report: &Report) -> String {

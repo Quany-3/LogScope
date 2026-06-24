@@ -149,6 +149,24 @@ impl BasicAnalyzer {
             slow_requests: self.detect_slow_requests(entries, slow_threshold_ms),
         }
     }
+
+    pub fn realtime_summary(&self, entries: &[LogEntry], recent_limit: usize) -> RealtimeSummary {
+        RealtimeSummary {
+            total_count: entries.len(),
+            warning_count: count_level(entries, LogLevel::Warn),
+            error_count: entries
+                .iter()
+                .filter(|entry| entry.level.is_error())
+                .count(),
+            top_sources: self.top_sources(entries, recent_limit),
+            recent_lines: entries
+                .iter()
+                .rev()
+                .take(recent_limit)
+                .map(LogEntry::display_line)
+                .collect(),
+        }
+    }
 }
 
 fn error_signature(message: &str) -> String {
@@ -164,6 +182,10 @@ fn error_signature(message: &str) -> String {
     } else {
         signature
     }
+}
+
+fn count_level(entries: &[LogEntry], level: LogLevel) -> usize {
+    entries.iter().filter(|entry| entry.level == level).count()
 }
 
 impl AnalysisService for BasicAnalyzer {
@@ -316,6 +338,23 @@ mod tests {
         assert_eq!(summary.slow_requests.len(), 2);
     }
 
+    #[test]
+    fn builds_realtime_summary_for_tui_panels() {
+        let entries = advanced_mock_entries();
+        let summary = BasicAnalyzer.realtime_summary(&entries, 2);
+
+        assert_eq!(summary.total_count, 4);
+        assert_eq!(summary.warning_count, 1);
+        assert_eq!(summary.error_count, 2);
+        assert_eq!(summary.top_sources[0].source, "api");
+        assert_eq!(summary.top_sources[0].count, 2);
+        assert_eq!(summary.recent_lines.len(), 2);
+        assert_eq!(
+            summary.recent_lines[0],
+            "2026-06-12T12:00:00Z ERROR db database timeout status=503 duration_ms=900"
+        );
+    }
+
     /// Shared sample entries for analyzer unit tests.
     fn mock_log_entries() -> Vec<LogEntry> {
         vec![
@@ -383,4 +422,14 @@ pub struct AnalysisSummary<'a> {
     pub top_sources: Vec<SourceRanking>,
     pub error_patterns: Vec<ErrorPattern>,
     pub slow_requests: Vec<&'a LogEntry>,
+}
+
+/// Compact, owned summary shaped for frequently refreshed TUI panels.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeSummary {
+    pub total_count: usize,
+    pub warning_count: usize,
+    pub error_count: usize,
+    pub top_sources: Vec<SourceRanking>,
+    pub recent_lines: Vec<String>,
 }
