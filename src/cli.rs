@@ -6,7 +6,7 @@ use crate::model::{
     ErrorPattern, FilterCondition, LogEntry, LogLevel, LogTimestamp, ReportExportFormat,
     ReportMetadata, SearchResult,
 };
-use crate::parser::{JsonLineLogParser, LogParser, PlainTextLogParser};
+use crate::parser::{JsonLineLogParser, LogParser, PlainTextLogParser, parse_file};
 use crate::report::{
     JsonReportWriter, MarkdownReportWriter, Report, ReportSectionBuilder, ReportWriter,
 };
@@ -38,7 +38,7 @@ pub enum Command {
     /// Analyze logs and export a Markdown or JSON report.
     Report(ReportArgs),
     /// Open the interactive terminal interface.
-    Tui,
+    Tui(TuiArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -101,6 +101,16 @@ pub struct ReportArgs {
     pub slow_threshold_ms: u64,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct TuiArgs {
+    /// Optional log file to load when the TUI starts.
+    pub input: Option<PathBuf>,
+    #[arg(long = "parser", value_enum)]
+    pub parser: Option<ParserKind>,
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ParserKind {
     Text,
@@ -129,8 +139,21 @@ pub fn execute(cli: &Cli) -> Result<CommandOutput> {
         Command::Analyze(args) => execute_analyze(args).map(CommandOutput::Analysis),
         Command::Search(args) => execute_search(args).map(CommandOutput::Search),
         Command::Report(args) => execute_report(args).map(CommandOutput::Report),
-        Command::Tui => crate::tui::run().map(|()| CommandOutput::Tui),
+        Command::Tui(args) => execute_tui(args).map(|()| CommandOutput::Tui),
     }
+}
+
+fn execute_tui(args: &TuiArgs) -> Result<()> {
+    if args.input.is_none() && args.config.is_none() {
+        return crate::tui::run();
+    }
+
+    let options = resolve_options(&args.input, args.parser, &args.config)?;
+    let parser = parser_for(options.parser);
+    let entries = parse_file(&options.input, parser.as_ref())
+        .with_context(|| format!("failed to parse input file {}", options.input.display()))?;
+
+    crate::tui::run_with_entries(options.input.display().to_string(), entries)
 }
 
 fn execute_analyze(args: &AnalyzeArgs) -> Result<AdvancedAnalysisOutput> {
@@ -425,7 +448,30 @@ mod tests {
     fn parses_tui_subcommand() {
         let cli = Cli::try_parse_from(["logscope", "tui"]).unwrap();
 
-        assert!(matches!(cli.command, Command::Tui));
+        assert!(matches!(cli.command, Command::Tui(_)));
+    }
+
+    #[test]
+    fn parses_tui_input_and_parser_options() {
+        let cli =
+            Cli::try_parse_from(["logscope", "tui", "--parser", "json", "logs/app.json"]).unwrap();
+        let Command::Tui(args) = &cli.command else {
+            panic!("expected tui command");
+        };
+
+        assert_eq!(args.input, Some(PathBuf::from("logs/app.json")));
+        assert_eq!(args.parser, Some(ParserKind::Json));
+    }
+
+    #[test]
+    fn parses_tui_config_option_without_input() {
+        let cli = Cli::try_parse_from(["logscope", "tui", "--config", "logscope.toml"]).unwrap();
+        let Command::Tui(args) = &cli.command else {
+            panic!("expected tui command");
+        };
+
+        assert_eq!(args.input, None);
+        assert_eq!(args.config, Some(PathBuf::from("logscope.toml")));
     }
 
     #[test]
