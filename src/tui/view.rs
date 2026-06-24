@@ -5,6 +5,7 @@ use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use unicode_width::UnicodeWidthChar;
 
 pub(super) fn render_app(frame: &mut Frame<'_>, app: &App) {
     let [header, body, footer] = Layout::vertical([
@@ -23,16 +24,19 @@ pub(super) fn render_app(frame: &mut Frame<'_>, app: &App) {
     .areas(side);
 
     frame.render_widget(
-        Paragraph::new(format!("LogScope - {}", app.source_label()))
-            .alignment(Alignment::Center)
-            .style(Style::default().add_modifier(Modifier::BOLD))
-            .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(truncate_text(
+            &format!("LogScope - {}", app.source_label()),
+            header.width.saturating_sub(2) as usize,
+        ))
+        .alignment(Alignment::Center)
+        .style(Style::default().add_modifier(Modifier::BOLD))
+        .block(Block::default().borders(Borders::ALL)),
         header,
     );
     frame.render_widget(
-        Paragraph::new(styled_log_lines(
-            app,
-            logs.height.saturating_sub(2) as usize,
+        Paragraph::new(truncate_lines(
+            styled_log_lines(app, logs.height.saturating_sub(2) as usize),
+            logs.width.saturating_sub(2) as usize,
         ))
         .wrap(Wrap { trim: false })
         .block(
@@ -43,19 +47,25 @@ pub(super) fn render_app(frame: &mut Frame<'_>, app: &App) {
         logs,
     );
     frame.render_widget(
-        Paragraph::new(styled_summary_lines(app))
-            .wrap(Wrap { trim: false })
-            .block(Block::default().title("Summary").borders(Borders::ALL)),
+        Paragraph::new(truncate_lines(
+            styled_summary_lines(app),
+            summary.width.saturating_sub(2) as usize,
+        ))
+        .wrap(Wrap { trim: false })
+        .block(Block::default().title("Summary").borders(Borders::ALL)),
         summary,
     );
     frame.render_widget(
-        Paragraph::new(styled_selected_entry_details(app))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title("Selected Entry")
-                    .borders(Borders::ALL),
-            ),
+        Paragraph::new(truncate_lines(
+            styled_selected_entry_details(app),
+            detail.width.saturating_sub(2) as usize,
+        ))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title("Selected Entry")
+                .borders(Borders::ALL),
+        ),
         detail,
     );
     let (preview_title, preview_lines) = if app.is_file_picker_open() {
@@ -64,22 +74,28 @@ pub(super) fn render_app(frame: &mut Frame<'_>, app: &App) {
         ("Report Preview", app.report_preview_lines())
     };
     frame.render_widget(
-        Paragraph::new(styled_preview_lines(preview_lines))
-            .wrap(Wrap { trim: false })
-            .block(Block::default().title(preview_title).borders(Borders::ALL)),
+        Paragraph::new(truncate_lines(
+            styled_preview_lines(preview_lines),
+            preview.width.saturating_sub(2) as usize,
+        ))
+        .wrap(Wrap { trim: false })
+        .block(Block::default().title(preview_title).borders(Borders::ALL)),
         preview,
     );
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                app.status_line().to_string(),
-                Style::default().fg(Color::Cyan),
-            )),
-            Line::from(Span::styled(
-                app.hint_line(),
-                Style::default().fg(Color::Gray),
-            )),
-        ])
+        Paragraph::new(truncate_lines(
+            vec![
+                Line::from(Span::styled(
+                    app.status_line().to_string(),
+                    Style::default().fg(Color::Cyan),
+                )),
+                Line::from(Span::styled(
+                    app.hint_line(),
+                    Style::default().fg(Color::Gray),
+                )),
+            ],
+            footer.width.saturating_sub(2) as usize,
+        ))
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL)),
         footer,
@@ -286,14 +302,68 @@ fn level_style(level: LogLevel) -> Style {
     }
 }
 
+fn truncate_lines(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|line| truncate_line(line, max_width))
+        .collect()
+}
+
+fn truncate_line(line: Line<'static>, max_width: usize) -> Line<'static> {
+    if max_width == 0 {
+        return Line::default();
+    }
+
+    let mut used_width = 0usize;
+    let mut spans = Vec::new();
+    for span in line.spans {
+        if used_width >= max_width {
+            break;
+        }
+
+        let text = truncate_text(span.content.as_ref(), max_width - used_width);
+        used_width += display_width(&text);
+        if !text.is_empty() {
+            spans.push(Span::styled(text, span.style));
+        }
+    }
+
+    Line::from(spans)
+}
+
+fn truncate_text(value: &str, max_width: usize) -> String {
+    let mut output = String::new();
+    let mut used_width = 0usize;
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used_width + character_width > max_width {
+            break;
+        }
+        output.push(character);
+        used_width += character_width;
+    }
+    output
+}
+
+fn display_width(value: &str) -> usize {
+    value
+        .chars()
+        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{level_style, render_app, styled_detail_line, styled_preview_line, summary_style};
+    use super::{
+        display_width, level_style, render_app, styled_detail_line, styled_preview_line,
+        summary_style, truncate_line,
+    };
     use crate::model::LogLevel;
     use crate::tui::app::App;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
 
     #[test]
     fn styles_log_levels_by_urgency() {
@@ -347,6 +417,24 @@ mod tests {
         assert_eq!(heading.spans[0].style.fg, Some(Color::Yellow));
         assert_eq!(count.spans[1].style.fg, Some(Color::Yellow));
         assert_eq!(count.spans[3].style.fg, Some(Color::LightGreen));
+    }
+
+    #[test]
+    fn truncates_styled_lines_by_unicode_display_width() {
+        let line = Line::from(vec![
+            Span::styled("Message: ", Style::default().fg(Color::Cyan)),
+            Span::raw("[10.10.10.1]内网IP[admin][Error][用户不存在/密码错误]"),
+        ]);
+
+        let truncated = truncate_line(line, 30);
+        let rendered = truncated
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(display_width(&rendered) <= 30);
+        assert!(rendered.is_char_boundary(rendered.len()));
     }
 
     #[test]
