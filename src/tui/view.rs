@@ -51,19 +51,20 @@ pub(super) fn render_app(frame: &mut Frame<'_>, app: &App) {
             ),
         detail,
     );
+    let (preview_title, preview_lines) = if app.is_file_picker_open() {
+        ("Open Log File", app.file_picker_lines())
+    } else {
+        ("Report Preview", app.report_preview_lines())
+    };
     frame.render_widget(
-        Paragraph::new(app.report_preview_lines().join("\n"))
+        Paragraph::new(preview_lines.join("\n"))
             .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title("Report Preview")
-                    .borders(Borders::ALL),
-            ),
+            .block(Block::default().title(preview_title).borders(Borders::ALL)),
         preview,
     );
     frame.render_widget(
         Paragraph::new(Line::from(format!(
-            "{} | Press q or Esc to exit",
+            "{} | o open file | q/Esc exit",
             app.status_line()
         )))
         .alignment(Alignment::Center)

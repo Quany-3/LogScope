@@ -15,7 +15,6 @@ use crate::utils::write_file_safely;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use std::fs;
 use std::path::PathBuf;
 
 /// Command line options for the LogScope binary.
@@ -44,9 +43,9 @@ pub enum Command {
 
 #[derive(Debug, Clone, Args)]
 pub struct AnalyzeArgs {
-    /// Input log file to parse.
+    /// Input log files to parse.
     #[arg(required_unless_present = "config")]
-    pub input: Option<PathBuf>,
+    pub input: Vec<PathBuf>,
     /// Parser implementation used for the input file.
     #[arg(long = "parser", value_enum)]
     pub parser: Option<ParserKind>,
@@ -63,9 +62,9 @@ pub struct AnalyzeArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct SearchArgs {
-    /// Input log file to search.
+    /// Input log files to search.
     #[arg(required_unless_present = "config")]
-    pub input: Option<PathBuf>,
+    pub input: Vec<PathBuf>,
     #[arg(long = "parser", value_enum)]
     pub parser: Option<ParserKind>,
     #[arg(long)]
@@ -85,7 +84,7 @@ pub struct SearchArgs {
 #[derive(Debug, Clone, Args)]
 pub struct ReportArgs {
     #[arg(required_unless_present = "config")]
-    pub input: Option<PathBuf>,
+    pub input: Vec<PathBuf>,
     #[arg(long = "parser", value_enum)]
     pub parser: Option<ParserKind>,
     #[arg(long)]
@@ -104,8 +103,8 @@ pub struct ReportArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct TuiArgs {
-    /// Optional log file to load when the TUI starts.
-    pub input: Option<PathBuf>,
+    /// Optional log files to load when the TUI starts.
+    pub input: Vec<PathBuf>,
     #[arg(long = "parser", value_enum)]
     pub parser: Option<ParserKind>,
     #[arg(long)]
@@ -145,16 +144,14 @@ pub fn execute(cli: &Cli) -> Result<CommandOutput> {
 }
 
 fn execute_tui(args: &TuiArgs) -> Result<()> {
-    if args.input.is_none() && args.config.is_none() {
+    if args.input.is_empty() && args.config.is_none() {
         return crate::tui::run();
     }
 
     let options = resolve_options(&args.input, args.parser, &args.config)?;
-    let parser = parser_for(options.parser);
-    let entries = parse_file(&options.input, parser.as_ref())
-        .with_context(|| format!("failed to parse input file {}", options.input.display()))?;
+    let entries = load_entries(&options)?;
 
-    crate::tui::run_with_entries(options.input.display().to_string(), entries)
+    crate::tui::run_with_entries(options.source_label(), entries)
 }
 
 fn execute_analyze(args: &AnalyzeArgs) -> Result<AdvancedAnalysisOutput> {
@@ -250,7 +247,7 @@ fn execute_report(args: &ReportArgs) -> Result<PathBuf> {
         title: args.title.clone(),
         metadata: Some(ReportMetadata {
             generated_at: LogTimestamp::new(Utc::now()),
-            source: options.input.display().to_string(),
+            source: options.source_label(),
             entry_count: entries.len(),
         }),
         summary: summary.basic,
@@ -271,20 +268,19 @@ fn execute_report(args: &ReportArgs) -> Result<PathBuf> {
 }
 
 fn load_entries(options: &RuntimeOptions) -> Result<Vec<LogEntry>> {
-    let content = fs::read_to_string(&options.input)
-        .with_context(|| format!("failed to read input file {}", options.input.display()))?;
-
     let parser = parser_for(options.parser);
     let mut entries = Vec::new();
-    for (index, line) in content.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
+    for input in &options.inputs {
+        let mut parsed = parse_file(input, parser.as_ref())
+            .with_context(|| format!("failed to parse input file {}", input.display()))?;
+        for entry in &mut parsed {
+            entry
+                .fields
+                .insert("origin_file".to_string(), input.display().to_string());
         }
-        let entry = parser
-            .parse_line(line)
-            .with_context(|| format!("failed to parse line {}", index + 1))?;
-        entries.push(entry);
+        entries.extend(parsed);
     }
+    entries.sort_by_key(|entry| entry.timestamp.value);
 
     Ok(entries)
 }
@@ -372,13 +368,23 @@ fn parser_for(parser: ParserKind) -> Box<dyn LogParser> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeOptions {
-    input: PathBuf,
+    inputs: Vec<PathBuf>,
     parser: ParserKind,
+}
+
+impl RuntimeOptions {
+    fn source_label(&self) -> String {
+        self.inputs
+            .iter()
+            .map(|input| input.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 /// Resolve effective options with explicit CLI values taking precedence.
 fn resolve_options(
-    input: &Option<PathBuf>,
+    input: &[PathBuf],
     parser: Option<ParserKind>,
     config_path: &Option<PathBuf>,
 ) -> Result<RuntimeOptions> {
@@ -387,15 +393,19 @@ fn resolve_options(
         .map(LogScopeConfig::load_from_file)
         .transpose()?;
 
-    let input = input
-        .clone()
-        .or_else(|| config.as_ref().map(|config| PathBuf::from(&config.input)))
-        .context("input file is required when no config file provides one")?;
+    let inputs = if input.is_empty() {
+        config
+            .as_ref()
+            .map(|config| vec![PathBuf::from(&config.input)])
+            .context("input file is required when no config file provides one")?
+    } else {
+        input.to_vec()
+    };
     let parser = parser
         .or_else(|| config.as_ref().map(|config| config.parser.into()))
         .unwrap_or(ParserKind::Text);
 
-    Ok(RuntimeOptions { input, parser })
+    Ok(RuntimeOptions { inputs, parser })
 }
 
 fn retain_allowed<'a>(current: &mut Vec<&'a LogEntry>, allowed: Vec<&'a LogEntry>) {
@@ -443,7 +453,28 @@ mod tests {
 
         assert_eq!(
             analyze_args(&cli).input,
-            Some(PathBuf::from("logs/app.log"))
+            vec![PathBuf::from("logs/app.log")]
+        );
+    }
+
+    #[test]
+    fn parses_multiple_input_files_for_analysis() {
+        let cli = Cli::try_parse_from([
+            "logscope",
+            "analyze",
+            "--parser",
+            "text",
+            "logs/api.log",
+            "logs/worker.log",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            analyze_args(&cli).input,
+            vec![
+                PathBuf::from("logs/api.log"),
+                PathBuf::from("logs/worker.log")
+            ]
         );
     }
 
@@ -462,7 +493,7 @@ mod tests {
             panic!("expected tui command");
         };
 
-        assert_eq!(args.input, Some(PathBuf::from("logs/app.json")));
+        assert_eq!(args.input, vec![PathBuf::from("logs/app.json")]);
         assert_eq!(args.parser, Some(ParserKind::Json));
     }
 
@@ -473,7 +504,7 @@ mod tests {
             panic!("expected tui command");
         };
 
-        assert_eq!(args.input, None);
+        assert!(args.input.is_empty());
         assert_eq!(args.config, Some(PathBuf::from("logscope.toml")));
     }
 
@@ -502,18 +533,35 @@ mod tests {
             analyze_args(&cli).config,
             Some(PathBuf::from("logscope.toml"))
         );
-        assert_eq!(analyze_args(&cli).input, None);
+        assert!(analyze_args(&cli).input.is_empty());
     }
 
     #[test]
     fn connects_cli_input_with_plain_text_parser() {
         let path = write_temp_log("2026-06-12T10:00:00Z INFO api request completed\n");
-        let cli = analyze_cli(Some(path.clone()), Some(ParserKind::Text), None);
+        let cli = analyze_cli(vec![path.clone()], Some(ParserKind::Text), None);
 
         let output = execute(&cli).unwrap();
 
         fs::remove_file(path).unwrap();
         assert_eq!(analysis_result(&output).total_count, 1);
+    }
+
+    #[test]
+    fn combines_multiple_input_files_for_analysis() {
+        let first = write_temp_log("2026-06-12T10:00:00Z INFO api request completed\n");
+        let second = write_temp_log("2026-06-12T10:01:00Z ERROR worker job failed\n");
+        let cli = analyze_cli(
+            vec![first.clone(), second.clone()],
+            Some(ParserKind::Text),
+            None,
+        );
+
+        let output = execute(&cli).unwrap();
+
+        fs::remove_file(first).unwrap();
+        fs::remove_file(second).unwrap();
+        assert_eq!(analysis_result(&output).total_count, 2);
     }
 
     #[test]
@@ -527,7 +575,7 @@ mod tests {
             "toml",
             &format!("input = \"{escaped_path}\"\nparser = \"json\"\n"),
         );
-        let cli = analyze_cli(None, None, Some(config_path.clone()));
+        let cli = analyze_cli(Vec::new(), None, Some(config_path.clone()));
 
         let output = execute(&cli).unwrap();
 
@@ -545,7 +593,7 @@ mod tests {
         let config_path =
             write_temp_file("toml", "input = \"samples/plain.log\"\nparser = \"text\"\n");
         let cli = analyze_cli(
-            Some(json_path.clone()),
+            vec![json_path.clone()],
             Some(ParserKind::Json),
             Some(config_path.clone()),
         );
@@ -572,7 +620,7 @@ mod tests {
     }
 
     fn analyze_cli(
-        input: Option<PathBuf>,
+        input: Vec<PathBuf>,
         parser: Option<ParserKind>,
         config: Option<PathBuf>,
     ) -> Cli {

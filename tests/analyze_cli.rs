@@ -16,7 +16,7 @@ fn parses_analyze_subcommand() {
     let Command::Analyze(args) = cli.command else {
         panic!("expected analyze command");
     };
-    assert_eq!(args.input.unwrap().to_string_lossy(), "samples/plain.log");
+    assert_eq!(args.input[0].to_string_lossy(), "samples/plain.log");
     assert_eq!(args.parser, Some(ParserKind::Text));
 }
 

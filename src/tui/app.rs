@@ -1,5 +1,7 @@
+
 use crate::analyzer::{BasicAnalyzer, OperationalInsights, RealtimeSummary};
 use crate::model::{LogEntry, LogTimestamp, ReportMetadata};
+use crate::parser::{JsonLineLogParser, PlainTextLogParser, parse_file};
 use crate::report::{
     MarkdownReportWriter, Report, ReportPreview, ReportSectionBuilder, build_insight_section,
     build_report_preview,
@@ -7,6 +9,9 @@ use crate::report::{
 use anyhow::{Context, Result};
 use chrono::Utc;
 use crossterm::event::{KeyCode, KeyEvent};
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 
 /// Runtime state shared by the TUI renderer and keyboard event loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +24,7 @@ pub struct App {
     insights: Option<OperationalInsights>,
     report_preview: ReportPreview,
     status_message: String,
+    file_picker: FilePickerState,
 }
 
 impl App {
@@ -42,6 +48,7 @@ impl App {
             insights: Some(insights),
             report_preview,
             status_message,
+            file_picker: FilePickerState::default(),
         })
     }
 
@@ -67,6 +74,46 @@ impl App {
 
     pub(crate) fn entries(&self) -> &[LogEntry] {
         &self.entries
+    }
+
+    pub fn is_file_picker_open(&self) -> bool {
+        self.file_picker.open
+    }
+
+    pub fn open_file_picker_with(&mut self, files: Vec<PathBuf>) {
+        self.file_picker = FilePickerState {
+            open: true,
+            files,
+            selected_index: 0,
+        };
+        if self.file_picker.files.is_empty() {
+            self.status_message = "No log files found.".to_string();
+        } else {
+            self.status_message = "Select a log file and press Enter.".to_string();
+        }
+    }
+
+    pub fn file_picker_lines(&self) -> Vec<String> {
+        if !self.file_picker.open {
+            return Vec::new();
+        }
+        if self.file_picker.files.is_empty() {
+            return vec!["No .log, .json, or .jsonl files found.".to_string()];
+        }
+
+        self.file_picker
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let marker = if index == self.file_picker.selected_index {
+                    "> "
+                } else {
+                    "  "
+                };
+                format!("{marker}{}", path.display())
+            })
+            .collect()
     }
 
     pub fn log_lines(&self) -> Vec<String> {
@@ -148,7 +195,12 @@ impl App {
 
     pub fn handle_key_event(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::Esc if self.file_picker.open => self.file_picker.open = false,
             KeyCode::Char('q') | KeyCode::Esc => self.running = false,
+            KeyCode::Char('o') => self.open_file_picker(),
+            KeyCode::Enter if self.file_picker.open => self.load_selected_file(),
+            KeyCode::Down if self.file_picker.open => self.move_file_picker(1),
+            KeyCode::Up if self.file_picker.open => self.move_file_picker(-1),
             KeyCode::Down => self.move_selection(1),
             KeyCode::Up => self.move_selection(-1),
             _ => {}
@@ -163,6 +215,42 @@ impl App {
         let next = current.saturating_add_signed(delta).min(last);
         self.selected_index = Some(next);
     }
+
+    fn open_file_picker(&mut self) {
+        self.open_file_picker_with(discover_log_files());
+    }
+
+    fn move_file_picker(&mut self, delta: isize) {
+        if self.file_picker.files.is_empty() {
+            return;
+        }
+        let last = self.file_picker.files.len().saturating_sub(1);
+        self.file_picker.selected_index = self
+            .file_picker
+            .selected_index
+            .saturating_add_signed(delta)
+            .min(last);
+    }
+
+    fn load_selected_file(&mut self) {
+        let Some(path) = self
+            .file_picker
+            .files
+            .get(self.file_picker.selected_index)
+            .cloned()
+        else {
+            return;
+        };
+
+        match parse_log_file(&path)
+            .and_then(|entries| Self::from_entries(path.display().to_string(), entries))
+        {
+            Ok(next) => *self = next,
+            Err(error) => {
+                self.status_message = format!("Failed to load {}: {error}", path.display())
+            }
+        }
+    }
 }
 
 impl Default for App {
@@ -176,8 +264,78 @@ impl Default for App {
             insights: None,
             report_preview: ReportPreview::default(),
             status_message: "No log file loaded.".to_string(),
+            file_picker: FilePickerState::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FilePickerState {
+    open: bool,
+    files: Vec<PathBuf>,
+    selected_index: usize,
+}
+
+fn discover_log_files() -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for directory in [Path::new("samples"), Path::new(".")] {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && is_supported_log_file(&path) {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn is_supported_log_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("log" | "json" | "jsonl")
+    )
+}
+
+fn parse_log_file(path: &Path) -> Result<Vec<LogEntry>> {
+    let mut entries = if should_parse_as_json(path)? {
+        parse_file(path, &JsonLineLogParser)?
+    } else {
+        parse_file(path, &PlainTextLogParser)?
+    };
+    for entry in &mut entries {
+        entry
+            .fields
+            .insert("origin_file".to_string(), path.display().to_string());
+    }
+    entries.sort_by_key(|entry| entry.timestamp.value);
+    Ok(entries)
+}
+
+fn should_parse_as_json(path: &Path) -> Result<bool> {
+    if matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("json" | "jsonl")
+    ) {
+        return Ok(true);
+    }
+
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to inspect log file {}", path.display()))?;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        return Ok(trimmed.starts_with('{'));
+    }
+
+    Ok(false)
 }
 
 fn build_tui_report(
@@ -210,6 +368,7 @@ mod tests {
     use crate::model::{LogEntry, LogLevel, LogSource, LogTimestamp};
     use chrono::{TimeZone, Utc};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::fs;
 
     #[test]
     fn builds_display_state_from_loaded_entries() {
@@ -301,6 +460,42 @@ mod tests {
         assert!(app.is_running());
     }
 
+    #[test]
+    fn file_picker_loads_selected_log_file() {
+        let path = write_temp_log("2026-06-12T10:00:00Z ERROR api failed duration_ms=1200\n");
+        let mut app = App::default();
+        app.open_file_picker_with(vec![path.clone()]);
+
+        assert!(app.is_file_picker_open());
+        assert_eq!(
+            app.file_picker_lines(),
+            vec![format!("> {}", path.display())]
+        );
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        fs::remove_file(&path).unwrap();
+        assert!(!app.is_file_picker_open());
+        assert_eq!(app.summary().total_count, 1);
+        assert_eq!(app.selected_entry_details()[1], "Level: ERROR");
+    }
+
+    #[test]
+    fn file_picker_detects_json_content_with_log_extension() {
+        let path = write_temp_log(
+            "{\"timestamp\":\"2026-06-12T10:00:00Z\",\"level\":\"INFO\",\"source\":\"api\",\"message\":\"service started\"}\n",
+        );
+        let mut app = App::default();
+        app.open_file_picker_with(vec![path.clone()]);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        fs::remove_file(&path).unwrap();
+        assert!(!app.is_file_picker_open());
+        assert_eq!(app.summary().total_count, 1);
+        assert_eq!(app.selected_entry_details()[1], "Level: INFO");
+    }
+
     fn sample_entries() -> Vec<LogEntry> {
         vec![
             sample_entry(LogLevel::Error, "failed duration_ms=1200", 1),
@@ -324,5 +519,17 @@ mod tests {
             raw: format!("{} {} api {}", timestamp.to_rfc3339(), level, message),
             message: message.to_string(),
         }
+    }
+
+    fn write_temp_log(content: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "logscope-picker-{}.log",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, content).unwrap();
+        path
     }
 }
