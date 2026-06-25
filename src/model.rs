@@ -1,3 +1,9 @@
+//! Domain models that represent parsed log entries, filter conditions, and report metadata.
+//!
+//! Every other module consumes the types defined here; the model is the shared
+//! vocabulary of the LogScope pipeline.
+
+/// Module identifier used for diagnostics and internal logging.
 pub const MODULE_NAME: &str = "model";
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -30,6 +36,7 @@ impl LogLevel {
         }
     }
 
+    /// Return the canonical uppercase label for this level (e.g. `"WARN"`).
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Trace => "TRACE",
@@ -41,6 +48,7 @@ impl LogLevel {
         }
     }
 
+    /// Whether this level represents a serious problem (`Error` or `Fatal`).
     pub const fn is_error(self) -> bool {
         matches!(self, Self::Error | Self::Fatal)
     }
@@ -76,6 +84,7 @@ impl LogEntry {
             .to_rfc3339_opts(SecondsFormat::Secs, true)
     }
 
+    /// Format the entry as a single terminal-friendly line: timestamp level source message.
     pub fn display_line(&self) -> String {
         format!(
             "{} {} {} {}",
@@ -94,6 +103,7 @@ pub struct LogSource {
 }
 
 impl LogSource {
+    /// Create a new source identifier from any string-like value.
     pub fn new(name: impl Into<String>) -> Self {
         Self { name: name.into() }
     }
@@ -106,6 +116,7 @@ pub struct LogTimestamp {
 }
 
 impl LogTimestamp {
+    /// Wrap a UTC datetime as a strongly-typed timestamp.
     pub fn new(value: DateTime<Utc>) -> Self {
         Self { value }
     }
@@ -122,6 +133,7 @@ pub struct FilterCondition {
 }
 
 impl FilterCondition {
+    /// Return `true` when no filter constraint is set.
     pub fn is_empty(&self) -> bool {
         self.keyword.is_none()
             && self.level.is_none()
@@ -139,6 +151,7 @@ pub struct SearchResult<'a> {
 }
 
 impl<'a> SearchResult<'a> {
+    /// Create a search result from a list of matching entry references.
     pub fn new(entries: Vec<&'a LogEntry>) -> Self {
         let total_matches = entries.len();
         Self {
@@ -147,6 +160,7 @@ impl<'a> SearchResult<'a> {
         }
     }
 
+    /// Return `true` when no entries matched the search.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -160,6 +174,7 @@ pub struct ReportMetadata {
     pub entry_count: usize,
 }
 
+/// Supported export formats for generated reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReportExportFormat {
@@ -169,6 +184,7 @@ pub enum ReportExportFormat {
 }
 
 impl ReportExportFormat {
+    /// File extension used when writing a report in this format.
     pub const fn extension(self) -> &'static str {
         match self {
             Self::Markdown => "md",
@@ -335,6 +351,7 @@ pub struct ErrorPattern {
 }
 
 impl ErrorPattern {
+    /// Create a new pattern with an initial occurrence count of 1.
     pub fn new(signature: impl Into<String>, sample_message: impl Into<String>) -> Self {
         Self {
             signature: signature.into(),

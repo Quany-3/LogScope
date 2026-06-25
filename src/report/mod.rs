@@ -1,3 +1,10 @@
+//! Report generation pipeline.
+//!
+//! Defines the format-neutral [`Report`] and [`ReportSection`] data structures,
+//! a [`ReportWriter`] trait for concrete renderers (Markdown, JSON, HTML), and
+//! helper functions for building sections and truncated previews.
+
+/// Module identifier used for diagnostics and internal logging.
 pub const MODULE_NAME: &str = "report";
 
 mod html;
@@ -33,6 +40,7 @@ pub struct ReportSection {
 }
 
 impl ReportSection {
+    /// Create a section with the given heading and body text.
     pub fn new(heading: impl Into<String>, body: impl Into<String>) -> Self {
         Self {
             heading: heading.into(),
@@ -41,8 +49,10 @@ impl ReportSection {
     }
 }
 
+/// Result type for report writing operations.
 pub type ReportResult<T> = Result<T, ReportError>;
 
+/// Errors that can occur during report generation.
 #[derive(Debug, Error)]
 pub enum ReportError {
     #[error("failed to serialize JSON report: {0}")]
@@ -62,12 +72,14 @@ pub struct ReportPreview {
     pub truncated: bool,
 }
 
+/// Build a truncated preview of the rendered report for the TUI side panel.
 pub fn build_report_preview(
     report: &Report,
     writer: &dyn ReportWriter,
     max_lines: usize,
 ) -> ReportResult<ReportPreview> {
     let rendered = writer.write(report)?;
+    // Store a line slice so the TUI preview can show truncated content without reparsing.
     let lines = rendered.lines().map(str::to_string).collect::<Vec<_>>();
     let total_lines = lines.len();
     let truncated = total_lines > max_lines;

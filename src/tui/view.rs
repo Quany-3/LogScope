@@ -1,3 +1,9 @@
+//! Rendering layer for the TUI.
+//!
+//! Maps [`App`] state to ratatui widgets, applying color and style rules based
+//! on log levels, severity scores, and entry field types. All CJK-aware
+//! truncation is handled here so that wide glyphs never cross panel borders.
+
 use super::app::App;
 use crate::model::LogLevel;
 use ratatui::Frame;
@@ -8,6 +14,18 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
+/// Top-level render function: clears the frame, splits the area into header,
+/// body (logs + side panel), and footer, then draws each widget.
+///
+/// Layout:
+/// ```text
+/// ┌──────────────── Header ─────────────────┐
+/// ├──────── Logs ────────┬──── Side Panel ──┤
+/// │                      │ Summary          │
+/// │                      │ Selected Entry   │
+/// │                      │ Report Preview   │
+/// ├──────────────── Footer ─────────────────┤
+/// ```
 pub(super) fn render_app(frame: &mut Frame<'_>, app: &App) {
     // Clear the in-memory frame before drawing widgets; avoids CJK stale cells without terminal flicker.
     frame.render_widget(Clear, frame.area());
@@ -105,6 +123,7 @@ pub(super) fn render_app(frame: &mut Frame<'_>, app: &App) {
     force_update_area(frame.buffer_mut(), frame_area);
 }
 
+/// Build styled log lines for the scrollable log panel.
 fn styled_log_lines(app: &App, max_rows: usize) -> Vec<Line<'static>> {
     if app.entries().is_empty() {
         return vec![Line::from("No log file loaded.")];
@@ -137,6 +156,7 @@ fn styled_log_lines(app: &App, max_rows: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// Build styled lines for the summary panel.
 fn styled_summary_lines(app: &App) -> Vec<Line<'static>> {
     app.summary_lines()
         .into_iter()
@@ -144,6 +164,7 @@ fn styled_summary_lines(app: &App) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// Build styled lines for the selected-entry detail panel.
 fn styled_selected_entry_details(app: &App) -> Vec<Line<'static>> {
     app.selected_entry_details()
         .into_iter()
@@ -151,6 +172,7 @@ fn styled_selected_entry_details(app: &App) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// Style a single detail line, coloring the label in cyan and the value based on field type.
 fn styled_detail_line(line: String) -> Line<'static> {
     let Some((label, value)) = line.split_once(": ") else {
         return Line::from(Span::styled(line, Style::default().fg(Color::Gray)));
@@ -173,6 +195,7 @@ fn styled_detail_line(line: String) -> Line<'static> {
     ])
 }
 
+/// Choose a color for a detail value based on the field name.
 fn detail_value_style(label: &str) -> Style {
     match label {
         "Timestamp" => Style::default().fg(Color::Blue),
@@ -184,10 +207,12 @@ fn detail_value_style(label: &str) -> Style {
     }
 }
 
+/// Build styled lines for the report preview or file picker overlay.
 fn styled_preview_lines(lines: Vec<String>) -> Vec<Line<'static>> {
     lines.into_iter().map(styled_preview_line).collect()
 }
 
+/// Style a single preview line: headings, level bullets, key-value pairs, and truncation notices.
 fn styled_preview_line(line: String) -> Line<'static> {
     if line.starts_with("# ") {
         return Line::from(Span::styled(
@@ -235,6 +260,7 @@ fn styled_preview_line(line: String) -> Line<'static> {
     Line::from(line)
 }
 
+/// Choose a color for a preview value based on the field label.
 fn preview_value_style(label: &str) -> Style {
     match label {
         "Total entries" => Style::default()
@@ -245,6 +271,7 @@ fn preview_value_style(label: &str) -> Style {
     }
 }
 
+/// Choose a style for a summary line based on its content prefix.
 fn summary_style(line: &str) -> Style {
     if line.starts_with("Errors:") || line.contains("errors ") {
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
@@ -265,6 +292,7 @@ fn summary_style(line: &str) -> Style {
     }
 }
 
+/// Map the numeric severity score to a color: red (≥70), yellow (35–69), green (<35).
 fn severity_style(line: &str) -> Style {
     let value = line
         .strip_prefix("Severity: ")
@@ -279,6 +307,7 @@ fn severity_style(line: &str) -> Style {
     }
 }
 
+/// Style a rate line: use `active_color` when the value is non-zero, green otherwise.
 fn rate_style(line: &str, active_color: Color) -> Style {
     let value = line
         .split_once(':')
@@ -295,6 +324,7 @@ fn rate_style(line: &str, active_color: Color) -> Style {
     }
 }
 
+/// Map a log level to its canonical TUI color.
 fn level_style(level: LogLevel) -> Style {
     match level {
         LogLevel::Trace | LogLevel::Debug => Style::default().fg(Color::Gray),
@@ -305,11 +335,13 @@ fn level_style(level: LogLevel) -> Style {
     }
 }
 
+/// Compute the usable content width inside a bordered block (subtract 4 for borders + padding).
 fn content_width(area_width: u16) -> usize {
     // Extra safety columns avoid CJK wide glyphs touching block borders.
     area_width.saturating_sub(4) as usize
 }
 
+/// Truncate a list of styled lines to the given display width.
 fn truncate_lines(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'static>> {
     lines
         .into_iter()
@@ -317,11 +349,16 @@ fn truncate_lines(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'stat
         .collect()
 }
 
+/// Truncate a single styled line to `max_width` display columns, preserving span styles.
+///
+/// Wide CJK glyphs are counted at their actual display width so the line never
+/// extends past the panel border.
 fn truncate_line(line: Line<'static>, max_width: usize) -> Line<'static> {
     if max_width == 0 {
         return Line::default();
     }
 
+    // Preserve style spans while trimming text to terminal display width.
     let mut used_width = 0usize;
     let mut spans = Vec::new();
     for span in line.spans {
@@ -339,6 +376,7 @@ fn truncate_line(line: Line<'static>, max_width: usize) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Truncate a raw string to `max_width` display columns, respecting CJK wide characters.
 fn truncate_text(value: &str, max_width: usize) -> String {
     let mut output = String::new();
     let mut used_width = 0usize;
@@ -353,6 +391,7 @@ fn truncate_text(value: &str, max_width: usize) -> String {
     output
 }
 
+/// Compute the total display width of a string, counting CJK wide chars as 2 columns.
 fn display_width(value: &str) -> usize {
     value
         .chars()
@@ -360,8 +399,12 @@ fn display_width(value: &str) -> usize {
         .sum()
 }
 
+/// Force every cell in the given area to be marked as "always update" in the
+/// diff stream. This is a workaround for Windows terminals that sometimes fail
+/// to repaint CJK wide glyphs when the cell content hasn't changed.
 fn force_update_area(buffer: &mut Buffer, area: Rect) {
     let area = area.intersection(*buffer.area());
+    // Force the region into the diff stream so Windows terminals repaint wide glyphs reliably.
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
             if let Some(cell) = buffer.cell_mut((x, y)) {

@@ -1,6 +1,10 @@
+//! Markdown report renderer — produces a human-readable text summary with
+//! heading levels, bullet lists, and metadata.
+
 use super::{Report, ReportResult, ReportWriter};
 use crate::model::LogLevel;
 
+/// Report writer that outputs Markdown.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MarkdownReportWriter;
 

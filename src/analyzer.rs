@@ -1,3 +1,11 @@
+//! Log analysis engine: aggregation, filtering, pattern detection, and operational insights.
+//!
+//! [`BasicAnalyzer`] is the main entry point. It counts log levels and sources,
+//! searches by keyword, filters by level/source/time range, detects error patterns
+//! and slow requests, and computes higher-level signals like severity scores and
+//! peak incident windows.
+
+/// Module identifier used for diagnostics and internal logging.
 pub const MODULE_NAME: &str = "analyzer";
 
 use crate::model::{ErrorPattern, LogEntry, LogLevel};
@@ -28,6 +36,10 @@ pub trait AnalysisService {
     fn analyze(&self, entries: &[LogEntry]) -> AnalysisResult;
 }
 
+/// Default analyzer that ships with LogScope.
+///
+/// Stateless — all methods take an explicit entry slice, so a single `BasicAnalyzer`
+/// can be reused across independent queries.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BasicAnalyzer;
 
@@ -41,6 +53,7 @@ impl BasicAnalyzer {
             .collect()
     }
 
+    /// Filter entries that match the given log level exactly.
     pub fn filter_by_level<'a>(
         &self,
         entries: &'a [LogEntry],
@@ -52,6 +65,7 @@ impl BasicAnalyzer {
             .collect()
     }
 
+    /// Filter entries whose source name equals `source`.
     pub fn filter_by_source<'a>(&self, entries: &'a [LogEntry], source: &str) -> Vec<&'a LogEntry> {
         entries
             .iter()
@@ -59,6 +73,7 @@ impl BasicAnalyzer {
             .collect()
     }
 
+    /// Filter entries whose timestamp falls within the inclusive range `[start, end]`.
     pub fn filter_by_time_range<'a>(
         &self,
         entries: &'a [LogEntry],
@@ -71,12 +86,14 @@ impl BasicAnalyzer {
             .collect()
     }
 
+    /// Rank sources by descending entry count, returning at most `limit` results.
     pub fn top_sources(&self, entries: &[LogEntry], limit: usize) -> Vec<SourceRanking> {
         let mut counts = HashMap::<String, usize>::new();
         for entry in entries {
             *counts.entry(entry.source.name.clone()).or_insert(0) += 1;
         }
 
+        // Sort by volume first, then by source name to keep the ranking stable.
         let mut rankings = counts
             .into_iter()
             .map(|(source, count)| SourceRanking { source, count })
@@ -91,9 +108,12 @@ impl BasicAnalyzer {
         rankings
     }
 
+    /// Group error/fatal entries by a normalized signature and return the most
+    /// frequent patterns, up to `limit`.
     pub fn top_error_patterns(&self, entries: &[LogEntry], limit: usize) -> Vec<ErrorPattern> {
         let mut grouped = BTreeMap::<String, (usize, String)>::new();
         for entry in entries.iter().filter(|entry| entry.level.is_error()) {
+            // Build a normalized signature so repeated failures collapse together.
             let signature = error_signature(&entry.message);
             let group = grouped
                 .entry(signature)
@@ -119,6 +139,7 @@ impl BasicAnalyzer {
         patterns
     }
 
+    /// Detect entries whose `duration_ms` structured field meets or exceeds the threshold.
     pub fn detect_slow_requests<'a>(
         &self,
         entries: &'a [LogEntry],
@@ -136,6 +157,7 @@ impl BasicAnalyzer {
             .collect()
     }
 
+    /// Produce a combined summary with basic stats, top sources, error patterns, and slow requests.
     pub fn build_summary<'a>(
         &self,
         entries: &'a [LogEntry],
@@ -150,6 +172,7 @@ impl BasicAnalyzer {
         }
     }
 
+    /// Compute a compact, owned summary suited for frequently refreshed TUI panels.
     pub fn realtime_summary(&self, entries: &[LogEntry], recent_limit: usize) -> RealtimeSummary {
         RealtimeSummary {
             total_count: entries.len(),
@@ -168,6 +191,8 @@ impl BasicAnalyzer {
         }
     }
 
+    /// Compute operational insights including severity score, peak window,
+    /// file-level activity, and request/job correlations.
     pub fn build_insights(
         &self,
         entries: &[LogEntry],
@@ -205,7 +230,10 @@ impl BasicAnalyzer {
     }
 }
 
+/// Normalize an error message into a stable signature by replacing volatile tokens
+/// (IPs, UUIDs, numbers, request IDs) with placeholders so repeated failures collapse together.
 fn error_signature(message: &str) -> String {
+    // Strip volatile tokens first so the same failure is grouped across retries.
     let signature = message
         .split_whitespace()
         .filter_map(normalize_error_token)
@@ -220,6 +248,8 @@ fn error_signature(message: &str) -> String {
     }
 }
 
+/// Normalize a single whitespace-delimited token, stripping punctuation and
+/// replacing dynamic values with placeholders.
 fn normalize_error_token(token: &str) -> Option<String> {
     let token = token.trim_matches(|character: char| character == ',' || character == ';');
     if token.is_empty() {
@@ -236,6 +266,7 @@ fn normalize_error_token(token: &str) -> Option<String> {
     Some(normalize_dynamic_value(token))
 }
 
+/// Structured keys that vary per request and should be excluded from error signatures.
 fn should_drop_structured_key(key: &str) -> bool {
     matches!(
         key.to_ascii_lowercase().as_str(),
@@ -250,7 +281,9 @@ fn should_drop_structured_key(key: &str) -> bool {
     )
 }
 
+/// Replace IPs, UUIDs, pure numbers, and path segments with stable placeholders.
 fn normalize_dynamic_value(value: &str) -> String {
+    // Replace values that typically change on every request with placeholders.
     if is_ipv4(value) {
         return "<ip>".to_string();
     }
@@ -266,6 +299,7 @@ fn normalize_dynamic_value(value: &str) -> String {
     value.to_string()
 }
 
+/// Replace numeric path segments (e.g. `/users/123`) with `<num>` placeholders.
 fn normalize_path_value(value: &str) -> String {
     value
         .split('/')
@@ -280,6 +314,7 @@ fn normalize_path_value(value: &str) -> String {
         .join("/")
 }
 
+/// Quick check: does `value` look like an IPv4 address?
 fn is_ipv4(value: &str) -> bool {
     let parts = value.split('.').collect::<Vec<_>>();
     parts.len() == 4
@@ -290,6 +325,7 @@ fn is_ipv4(value: &str) -> bool {
         })
 }
 
+/// Quick check: does `value` follow the 8-4-4-4-12 hex group pattern of a UUID?
 fn is_uuid(value: &str) -> bool {
     let groups = value.split('-').collect::<Vec<_>>();
     let lengths = [8, 4, 4, 4, 12];
@@ -299,10 +335,12 @@ fn is_uuid(value: &str) -> bool {
         })
 }
 
+/// Count entries that match the given level exactly.
 fn count_level(entries: &[LogEntry], level: LogLevel) -> usize {
     entries.iter().filter(|entry| entry.level == level).count()
 }
 
+/// Compute `count / total * 100` as a `u8`, clamped to 0–100.
 fn percent(count: usize, total: usize) -> u8 {
     count
         .saturating_mul(100)
@@ -311,6 +349,10 @@ fn percent(count: usize, total: usize) -> u8 {
         .min(100) as u8
 }
 
+/// Derive a 0–100 severity score from error rate, slow rate, fatal count, and peak pressure.
+///
+/// Formula: `error_rate + slow_rate/2 + fatal_count*30 + peak_pressure`, capped at 100.
+/// Peak pressure adds weight when a time window has concentrated errors/warnings.
 fn severity_score(
     error_rate_percent: u8,
     slow_rate_percent: u8,
@@ -329,6 +371,11 @@ fn severity_score(
         .min(100) as u8
 }
 
+/// Slide a fixed-duration window across time-sorted entries and return the
+/// window with the highest error+warning concentration.
+///
+/// Uses a two-pointer approach: the right pointer advances for every entry,
+/// while the left pointer shrinks the window to respect `window_seconds`.
 fn peak_window(entries: &[LogEntry], window_seconds: i64) -> Option<TimeWindowInsight> {
     let mut ordered = entries.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|entry| entry.timestamp.value);
@@ -386,9 +433,12 @@ fn peak_window(entries: &[LogEntry], window_seconds: i64) -> Option<TimeWindowIn
     best
 }
 
+/// Group entries by `request_id` or `job_id` fields and return correlations
+/// where more than one entry shares the same key.
 fn correlated_activity(entries: &[LogEntry], limit: usize) -> Vec<CorrelationInsight> {
     let mut grouped = BTreeMap::<String, Vec<&LogEntry>>::new();
     for entry in entries {
+        // request_id/job_id are the two correlation keys this app understands today.
         for key in ["request_id", "job_id"] {
             if let Some(value) = entry.fields.get(key) {
                 grouped
@@ -428,6 +478,7 @@ fn correlated_activity(entries: &[LogEntry], limit: usize) -> Vec<CorrelationIns
     groups
 }
 
+/// Rank files (via the `origin_file` field) by severity score and return the top entries.
 fn file_activity(
     entries: &[LogEntry],
     slow_threshold_ms: u64,
@@ -435,6 +486,7 @@ fn file_activity(
 ) -> Vec<FileActivityInsight> {
     let mut grouped = BTreeMap::<String, Vec<&LogEntry>>::new();
     for entry in entries {
+        // origin_file is injected by the parser/loader so file-level severity can be ranked later.
         if let Some(path) = entry.fields.get("origin_file") {
             grouped.entry(path.clone()).or_default().push(entry);
         }
@@ -496,6 +548,7 @@ fn file_activity(
     activity
 }
 
+/// Collect unique source names from a slice of borrowed entries.
 fn unique_sources(entries: &[&LogEntry]) -> Vec<String> {
     let mut sources = entries
         .iter()
@@ -861,6 +914,7 @@ mod tests {
     }
 }
 
+/// A source name paired with its entry count, used for ranked lists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceRanking {
     pub source: String,
@@ -897,6 +951,7 @@ pub struct OperationalInsights {
     pub correlations: Vec<CorrelationInsight>,
 }
 
+/// The busiest time window within the analyzed period.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimeWindowInsight {
     pub start: DateTime<Utc>,
@@ -906,6 +961,7 @@ pub struct TimeWindowInsight {
     pub warning_count: usize,
 }
 
+/// A group of entries linked by a shared correlation key (e.g. `request_id=abc`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorrelationInsight {
     pub key: String,
@@ -915,6 +971,7 @@ pub struct CorrelationInsight {
     pub sample_messages: Vec<String>,
 }
 
+/// Per-file health metrics derived from the `origin_file` structured field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileActivityInsight {
     pub path: String,

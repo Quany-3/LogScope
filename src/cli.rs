@@ -1,3 +1,10 @@
+//! Command-line interface built on [`clap`].
+//!
+//! Defines the `logscope` binary's subcommands (`analyze`, `search`, `report`,
+//! `tui`), their arguments, and the glue code that wires parsing, analysis,
+//! and report generation together.
+
+/// Module identifier used for diagnostics and internal logging.
 pub const MODULE_NAME: &str = "cli";
 
 use crate::analyzer::{AnalysisResult, BasicAnalyzer, SourceRanking};
@@ -41,6 +48,7 @@ pub enum Command {
     Tui(TuiArgs),
 }
 
+/// Arguments for the `analyze` subcommand.
 #[derive(Debug, Clone, Args)]
 pub struct AnalyzeArgs {
     /// Input log files to parse.
@@ -60,6 +68,7 @@ pub struct AnalyzeArgs {
     pub slow_threshold_ms: u64,
 }
 
+/// Arguments for the `search` subcommand.
 #[derive(Debug, Clone, Args)]
 pub struct SearchArgs {
     /// Input log files to search.
@@ -81,6 +90,7 @@ pub struct SearchArgs {
     pub end: Option<DateTime<Utc>>,
 }
 
+/// Arguments for the `report` subcommand.
 #[derive(Debug, Clone, Args)]
 pub struct ReportArgs {
     #[arg(required_unless_present = "config")]
@@ -111,6 +121,7 @@ pub struct TuiArgs {
     pub config: Option<PathBuf>,
 }
 
+/// Parser type selectable from the command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ParserKind {
     Auto,
@@ -118,6 +129,7 @@ pub enum ParserKind {
     Json,
 }
 
+/// Structured output of the `analyze` subcommand (basic stats + rankings + slow requests).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdvancedAnalysisOutput {
     pub basic: AnalysisResult,
@@ -126,6 +138,7 @@ pub struct AdvancedAnalysisOutput {
     pub slow_requests: Vec<LogEntry>,
 }
 
+/// Tagged union for the different kinds of output a subcommand can produce.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandOutput {
     Analysis(AdvancedAnalysisOutput),
@@ -181,6 +194,7 @@ fn execute_search(args: &SearchArgs) -> Result<Vec<LogEntry>> {
     let analyzer = BasicAnalyzer;
     let mut matches = entries.iter().collect::<Vec<_>>();
 
+    // Intersect each filter against the current match set so all criteria compose.
     if let Some(keyword) = condition.keyword.as_deref() {
         retain_allowed(&mut matches, analyzer.search_keyword(&entries, keyword));
     }
@@ -273,6 +287,7 @@ fn execute_report(args: &ReportArgs) -> Result<PathBuf> {
 fn load_entries(options: &RuntimeOptions) -> Result<Vec<LogEntry>> {
     let mut entries = Vec::new();
     for input in &options.inputs {
+        // Record the physical source file on each entry for later reporting.
         parse_input_file_with(input, options.parser, |mut entry| {
             entry
                 .fields
@@ -286,6 +301,7 @@ fn load_entries(options: &RuntimeOptions) -> Result<Vec<LogEntry>> {
     Ok(entries)
 }
 
+/// Parse the CLI, execute the requested command, and print the result.
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let output = execute(&cli)?;
@@ -293,6 +309,7 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+/// Render [`CommandOutput`] as human-readable text for terminal output.
 pub fn format_command_output(output: &CommandOutput) -> String {
     match output {
         CommandOutput::Analysis(result) => format_advanced_analysis_summary(result),
@@ -309,6 +326,7 @@ pub fn format_command_output(output: &CommandOutput) -> String {
     }
 }
 
+/// Render the advanced analysis result (basic stats, top sources, error patterns, slow requests).
 pub fn format_advanced_analysis_summary(result: &AdvancedAnalysisOutput) -> String {
     let mut display = format_analysis_summary(&result.basic);
 
@@ -360,6 +378,7 @@ pub fn format_analysis_summary(result: &AnalysisResult) -> String {
     summary.trim_end().to_string()
 }
 
+/// Dispatch to the correct parser implementation based on the user's selection.
 fn parse_input_file_with(
     input: &PathBuf,
     parser: ParserKind,
@@ -372,6 +391,7 @@ fn parse_input_file_with(
     }
 }
 
+/// Resolved runtime settings after merging CLI arguments with an optional config file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeOptions {
     inputs: Vec<PathBuf>,
@@ -379,6 +399,7 @@ struct RuntimeOptions {
 }
 
 impl RuntimeOptions {
+    /// Human-readable label for the configured input source(s).
     fn source_label(&self) -> String {
         self.inputs
             .iter()
@@ -400,6 +421,7 @@ fn resolve_options(
         .transpose()?;
 
     let inputs = if input.is_empty() {
+        // A config file can fully define the runtime when the CLI omits paths.
         config
             .as_ref()
             .map(|config| vec![PathBuf::from(&config.input)])
@@ -415,6 +437,7 @@ fn resolve_options(
 }
 
 fn retain_allowed<'a>(current: &mut Vec<&'a LogEntry>, allowed: Vec<&'a LogEntry>) {
+    // Keep the original ordering while applying the next filter stage.
     current.retain(|entry| allowed.contains(entry));
 }
 

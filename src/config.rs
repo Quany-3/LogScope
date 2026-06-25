@@ -1,3 +1,9 @@
+//! TOML-based configuration for LogScope defaults.
+//!
+//! A config file can supply the input path, parser format, and report output
+//! settings so users don't have to repeat them on every CLI invocation.
+
+/// Module identifier used for diagnostics and internal logging.
 pub const MODULE_NAME: &str = "config";
 
 use crate::model::ReportExportFormat;
@@ -15,12 +21,14 @@ pub struct LogScopeConfig {
     pub report: Option<ReportOutputConfig>,
 }
 
+/// Report output settings that can be set via config.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReportOutputConfig {
     pub path: String,
     pub format: ReportExportFormat,
 }
 
+/// Parser format selectable from the config file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ParserFormat {

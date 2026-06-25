@@ -1,7 +1,14 @@
+//! HTML report renderer with CSS-only donut and bar charts.
+//!
+//! The output is a self-contained HTML file with inline styles — no external
+//! JavaScript or CSS dependencies. Chart segments use `conic-gradient` so the
+//! report remains static and easy to share.
+
 use super::{Report, ReportResult, ReportWriter};
 use crate::model::LogLevel;
 use std::fmt::Write;
 
+/// Report writer that produces a standalone HTML document.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct HtmlReportWriter;
 
@@ -102,6 +109,7 @@ impl ReportWriter for HtmlReportWriter {
     }
 }
 
+/// Inline CSS for the HTML report. Kept as a constant so the output is self-contained.
 const HTML_STYLE: &str = r#"<style>
 *{box-sizing:border-box}
 body{margin:0;background:#f6f8fb;color:#102033;font-family:Segoe UI,Arial,sans-serif}
@@ -134,6 +142,7 @@ pre{white-space:pre-wrap;font-family:Consolas,monospace;background:#0f172a;color
 </style>
 "#;
 
+/// Render a metric card (label + large value) for the top summary row.
 fn metric_card(label: &str, value: &str) -> String {
     format!(
         "<article class=\"metric\"><div class=\"label\">{}</div><div class=\"value\">{}</div></article>\n",
@@ -142,6 +151,7 @@ fn metric_card(label: &str, value: &str) -> String {
     )
 }
 
+/// Render a horizontal bar row with label, proportional fill, and count.
 fn bar_row(label: &str, count: usize, total: usize) -> String {
     let width = count
         .saturating_mul(100)
@@ -157,7 +167,9 @@ fn bar_row(label: &str, count: usize, total: usize) -> String {
     )
 }
 
+/// Build a donut card from a CSS conic-gradient and a color legend.
 fn donut_card(title: &str, segments: &[ChartSegment], total: usize) -> String {
+    // Build the card from a CSS conic-gradient so the report stays dependency-free.
     let gradient = conic_gradient(segments, total);
     let mut output = format!(
         "<article class=\"donut-card\"><div class=\"donut-title\">{}</div><div class=\"donut\" style=\"background:{}\"></div><div class=\"legend\">\n",
@@ -178,11 +190,13 @@ fn donut_card(title: &str, segments: &[ChartSegment], total: usize) -> String {
     output
 }
 
+/// Convert segment counts into a `conic-gradient(...)` CSS value string.
 fn conic_gradient(segments: &[ChartSegment], total: usize) -> String {
     if total == 0 {
         return "#e5e7eb".to_string();
     }
 
+    // Convert counts into percentage slices for the donut background.
     let mut start = 0usize;
     let mut parts = Vec::new();
     for segment in segments.iter().filter(|segment| segment.count > 0) {
@@ -203,6 +217,7 @@ fn conic_gradient(segments: &[ChartSegment], total: usize) -> String {
     }
 }
 
+/// Build chart segments for each log level with a fixed color palette.
 fn level_segments(report: &Report) -> Vec<ChartSegment> {
     [
         (LogLevel::Trace, "#94a3b8"),
@@ -226,6 +241,7 @@ fn level_segments(report: &Report) -> Vec<ChartSegment> {
     .collect()
 }
 
+/// Build chart segments for each source, cycling through an 8-color palette.
 fn source_segments(sources: &[(&String, usize)]) -> Vec<ChartSegment> {
     const COLORS: [&str; 8] = [
         "#38bdf8", "#ef4444", "#22c55e", "#f59e0b", "#a855f7", "#14b8a6", "#f97316", "#64748b",
@@ -243,7 +259,9 @@ fn source_segments(sources: &[(&String, usize)]) -> Vec<ChartSegment> {
         .collect()
 }
 
+/// Sort source entries by descending count, then alphabetically for stability.
 fn sorted_sources(report: &Report) -> Vec<(&String, usize)> {
+    // Keep the most frequent sources first so the report stays stable and readable.
     let mut sources = report
         .summary
         .source_counts
@@ -254,6 +272,7 @@ fn sorted_sources(report: &Report) -> Vec<(&String, usize)> {
     sources
 }
 
+/// A slice of a donut chart with a label, count, and CSS color.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChartSegment {
     label: String,
@@ -261,6 +280,7 @@ struct ChartSegment {
     color: &'static str,
 }
 
+/// Escape `&`, `<`, `>`, and `"` for safe embedding in HTML.
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")

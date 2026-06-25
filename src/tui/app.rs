@@ -1,3 +1,8 @@
+//! Application state and event handling for the TUI.
+//!
+//! [`App`] owns the loaded log entries, filter state, summary, insights, and
+//! report preview. All keyboard events are routed through [`App::handle_key_event`].
+
 use crate::analyzer::{BasicAnalyzer, OperationalInsights, RealtimeSummary};
 use crate::model::{LogEntry, LogLevel, LogTimestamp, ReportMetadata};
 use crate::parser::parse_file_auto_with;
@@ -13,31 +18,49 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// File size threshold above which a log file is considered "large" (50 MiB).
+/// Large-file inputs trigger a scrolling-window hint in the TUI.
 const LARGE_LOG_FILE_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Runtime state shared by the TUI renderer and keyboard event loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct App {
+    /// Whether the event loop should keep running.
     running: bool,
+    /// Human-readable label for the loaded log source.
     source_label: String,
+    /// All parsed log entries, sorted by timestamp.
     entries: Vec<LogEntry>,
+    /// Indices into `entries` that pass the current filter.
     filtered_indices: Vec<usize>,
+    /// Cursor position within `filtered_indices` (not the entries slice).
     selected_filtered_index: Option<usize>,
+    /// Vertical scroll offset for the log panel.
     log_offset: usize,
+    /// Active level and keyword filters.
     filters: LogFilters,
+    /// When `Some`, the user is typing a search keyword.
     search_input: Option<String>,
+    /// When `true`, the next quit key will actually exit (two-press confirmation).
     quit_pending: bool,
+    /// Precomputed summary for the right panel.
     summary: RealtimeSummary,
+    /// Precomputed operational insights for the right panel and reports.
     insights: Option<OperationalInsights>,
+    /// Truncated markdown preview shown in the bottom-right panel.
     report_preview: ReportPreview,
+    /// One-line status message displayed in the footer.
     status_message: String,
+    /// State for the file picker overlay.
     file_picker: FilePickerState,
 }
 
 impl App {
+    /// Build an `App` from pre-parsed entries, precomputing the summary and report preview.
     pub fn from_entries(source_label: impl Into<String>, entries: Vec<LogEntry>) -> Result<Self> {
         let source_label = source_label.into();
         let analyzer = BasicAnalyzer;
+        // Precompute the first summary/report snapshot so the TUI can render immediately.
         let summary = analyzer.realtime_summary(&entries, 10);
         let insights = analyzer.build_insights(&entries, 60, 1_000, 5);
         let report = build_tui_report(&source_label, &entries, &insights);
@@ -65,34 +88,42 @@ impl App {
         })
     }
 
+    /// Whether the event loop should continue running.
     pub fn is_running(&self) -> bool {
         self.running
     }
 
+    /// The display label for the loaded log source.
     pub fn source_label(&self) -> &str {
         &self.source_label
     }
 
+    /// Precomputed summary for the right panel.
     pub fn summary(&self) -> &RealtimeSummary {
         &self.summary
     }
 
+    /// Truncated markdown report preview for the bottom-right panel.
     pub fn report_preview(&self) -> &ReportPreview {
         &self.report_preview
     }
 
+    /// Absolute index of the selected entry in the `entries` slice, if any.
     pub fn selected_index(&self) -> Option<usize> {
         self.selected_entry_index()
     }
 
+    /// Current vertical scroll offset for the log list.
     pub fn log_offset(&self) -> usize {
         self.log_offset
     }
 
+    /// Read-only access to the full entry list.
     pub(crate) fn entries(&self) -> &[LogEntry] {
         &self.entries
     }
 
+    /// Return the entries visible in the log panel, respecting scroll offset and row limit.
     pub(crate) fn visible_log_entries(&self, max_rows: usize) -> Vec<(usize, &LogEntry)> {
         if max_rows == 0 {
             return Vec::new();
@@ -108,6 +139,7 @@ impl App {
             .collect()
     }
 
+    /// Human-readable description of the active filter.
     pub fn filter_label(&self) -> String {
         if let Some(search_input) = &self.search_input {
             return format!("searching: {search_input}");
@@ -115,10 +147,12 @@ impl App {
         self.filters.label()
     }
 
+    /// Whether the file picker overlay is currently shown.
     pub fn is_file_picker_open(&self) -> bool {
         self.file_picker.open
     }
 
+    /// Open the file picker overlay with a pre-populated list of log files.
     pub fn open_file_picker_with(&mut self, files: Vec<PathBuf>) {
         self.file_picker = FilePickerState {
             open: true,
@@ -135,6 +169,7 @@ impl App {
         }
     }
 
+    /// Open the file picker overlay rooted at the given directory.
     pub fn open_file_picker_at(&mut self, directory: PathBuf) {
         self.file_picker = FilePickerState {
             open: true,
@@ -151,6 +186,7 @@ impl App {
         }
     }
 
+    /// Rendered lines for the file picker overlay.
     pub fn file_picker_lines(&self) -> Vec<String> {
         if !self.file_picker.open {
             return Vec::new();
@@ -181,6 +217,7 @@ impl App {
             .collect()
     }
 
+    /// The log lines visible in the log panel (up to 20 rows from the current offset).
     pub fn log_lines(&self) -> Vec<String> {
         if self.filtered_indices.is_empty() {
             return vec!["No log file loaded.".to_string()];
@@ -195,9 +232,11 @@ impl App {
             .collect()
     }
 
+    /// Lines for the summary panel, recomputed from the filtered subset.
     pub fn summary_lines(&self) -> Vec<String> {
         let filtered_entries = self.filtered_entries();
         let analyzer = BasicAnalyzer;
+        // Recompute from the filtered subset so the side panel always matches what is visible.
         let summary = analyzer.realtime_summary(&filtered_entries, 10);
         let insights = analyzer.build_insights(&filtered_entries, 60, 1_000, 5);
         let mut lines = vec![
@@ -233,6 +272,7 @@ impl App {
         lines
     }
 
+    /// Formatted key-value lines for the selected entry detail panel.
     pub fn selected_entry_details(&self) -> Vec<String> {
         let Some(index) = self.selected_entry_index() else {
             return vec!["No entry selected.".to_string()];
@@ -253,10 +293,12 @@ impl App {
         details
     }
 
+    /// The current one-line status message for the footer.
     pub fn status_line(&self) -> &str {
         &self.status_message
     }
 
+    /// Contextual keyboard hint line for the footer.
     pub fn hint_line(&self) -> String {
         if let Some(input) = &self.search_input {
             return format!("Search: {input}_ | Enter apply | Esc cancel | Backspace delete");
@@ -273,6 +315,7 @@ impl App {
             .to_string()
     }
 
+    /// Report preview lines, with a truncation notice when the full report is longer.
     pub fn report_preview_lines(&self) -> Vec<String> {
         if self.report_preview.lines.is_empty() {
             return vec!["No report preview available.".to_string()];
@@ -288,6 +331,7 @@ impl App {
         lines
     }
 
+    /// Dispatch a key press to the appropriate handler (search, filter, navigation, etc.).
     pub fn handle_key_event(&mut self, key: KeyEvent) {
         if self.handle_search_key_event(key) {
             return;
@@ -347,6 +391,7 @@ impl App {
         let Some(selected_index) = self.selected_filtered_index else {
             return self.log_offset;
         };
+        // Keep the selected row inside the viewport instead of jumping the window every keypress.
         if self.filtered_indices.len() <= max_rows {
             return 0;
         }
@@ -420,6 +465,7 @@ impl App {
     }
 
     fn apply_filters(&mut self) {
+        // Store indexes rather than cloning entries so filtering stays cheap on large inputs.
         self.filtered_indices = self
             .entries
             .iter()
@@ -442,6 +488,7 @@ impl App {
         }
 
         let analyzer = BasicAnalyzer;
+        // Export always uses the full loaded dataset so the report is not scoped by transient TUI filters.
         let insights = analyzer.build_insights(&self.entries, 60, 1_000, 5);
         let report = build_tui_report(&self.source_label, &self.entries, &insights);
         match HtmlReportWriter
@@ -535,6 +582,7 @@ impl App {
         }
         let has_large_file = has_large_log_file(&paths);
 
+        // Replace the whole app state so selection, summaries, and preview stay consistent.
         match parse_log_files(&paths)
             .and_then(|entries| Self::from_entries(source_label_for_paths(&paths), entries))
         {
@@ -593,6 +641,7 @@ impl Default for App {
     }
 }
 
+/// Combined level and keyword filter state for the TUI.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct LogFilters {
     min_level: Option<LogLevel>,
@@ -600,6 +649,7 @@ struct LogFilters {
 }
 
 impl LogFilters {
+    /// Return `true` when the entry satisfies both the minimum-level and keyword constraints.
     fn matches(&self, entry: &LogEntry) -> bool {
         if let Some(min_level) = self.min_level
             && !level_at_least(entry.level, min_level)
@@ -607,6 +657,7 @@ impl LogFilters {
             return false;
         }
         if let Some(keyword) = &self.keyword {
+            // Search both raw and normalized message text so structured and plain logs behave the same.
             let keyword = keyword.to_ascii_lowercase();
             let raw = entry.raw.to_ascii_lowercase();
             let message = entry.message.to_ascii_lowercase();
@@ -617,6 +668,7 @@ impl LogFilters {
         true
     }
 
+    /// Human-readable label describing the active filters.
     fn label(&self) -> String {
         match (self.min_level, self.keyword.as_deref()) {
             (Some(LogLevel::Error), Some(keyword)) => format!("ERROR+ search: {keyword}"),
@@ -629,10 +681,12 @@ impl LogFilters {
     }
 }
 
+/// Check whether `level` is at least `min_level` using numeric rank comparison.
 fn level_at_least(level: LogLevel, min_level: LogLevel) -> bool {
     level_rank(level) >= level_rank(min_level)
 }
 
+/// Assign a numeric rank to each level for minimum-level comparisons.
 fn level_rank(level: LogLevel) -> u8 {
     match level {
         LogLevel::Trace => 0,
@@ -644,6 +698,7 @@ fn level_rank(level: LogLevel) -> u8 {
     }
 }
 
+/// State for the file picker overlay: list of files, cursor, and marked selections.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct FilePickerState {
     open: bool,
@@ -653,6 +708,7 @@ struct FilePickerState {
     current_dir: Option<PathBuf>,
 }
 
+/// Scan a directory for supported log files and subdirectories.
 fn discover_file_picker_entries(directory: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let Ok(entries) = fs::read_dir(directory) else {
@@ -671,6 +727,7 @@ fn discover_file_picker_entries(directory: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Check whether a file extension is `.log`, `.json`, or `.jsonl`.
 fn is_supported_log_file(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|extension| extension.to_str()),
@@ -678,9 +735,11 @@ fn is_supported_log_file(path: &Path) -> bool {
     )
 }
 
+/// Parse a single log file, tagging each entry with its `origin_file` field.
 fn parse_log_file(path: &Path) -> Result<Vec<LogEntry>> {
     let mut entries = Vec::new();
     parse_file_auto_with(path, |mut entry| {
+        // Tag each entry with its source file before cross-file sorting merges them.
         entry
             .fields
             .insert("origin_file".to_string(), path.display().to_string());
@@ -690,6 +749,7 @@ fn parse_log_file(path: &Path) -> Result<Vec<LogEntry>> {
     Ok(entries)
 }
 
+/// Parse multiple log files and merge the results sorted by timestamp.
 fn parse_log_files(paths: &[PathBuf]) -> Result<Vec<LogEntry>> {
     let mut entries = Vec::new();
     for path in paths {
@@ -702,6 +762,7 @@ fn parse_log_files(paths: &[PathBuf]) -> Result<Vec<LogEntry>> {
     Ok(entries)
 }
 
+/// Build a comma-separated label from a list of file paths.
 fn source_label_for_paths(paths: &[PathBuf]) -> String {
     paths
         .iter()
@@ -710,24 +771,28 @@ fn source_label_for_paths(paths: &[PathBuf]) -> String {
         .join(", ")
 }
 
+/// Return `true` if any of the given paths exceeds the large-file threshold.
 fn has_large_log_file(paths: &[PathBuf]) -> bool {
     paths
         .iter()
         .any(|path| is_large_log_file_with_threshold(path, LARGE_LOG_FILE_BYTES))
 }
 
+/// Check whether a single file meets or exceeds the byte threshold.
 fn is_large_log_file_with_threshold(path: &Path, threshold: u64) -> bool {
     fs::metadata(path)
         .map(|metadata| metadata.len() >= threshold)
         .unwrap_or(false)
 }
 
+/// Assemble a [`Report`] for the TUI preview panel from the current entries and insights.
 fn build_tui_report(
     source_label: &str,
     entries: &[LogEntry],
     insights: &OperationalInsights,
 ) -> Report {
     let analyzer = BasicAnalyzer;
+    // Keep the TUI preview compact while reusing the same report pipeline as CLI export.
     let summary = analyzer.build_summary(entries, 5, 1_000);
     let mut source_section = ReportSectionBuilder::new("Top Sources");
     for ranking in &summary.top_sources {
