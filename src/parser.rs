@@ -1,3 +1,12 @@
+//! Log file parsers that normalize plain-text and JSON lines into [`LogEntry`] values.
+//!
+//! The module provides a [`LogParser`] trait and two concrete implementations:
+//! [`PlainTextLogParser`] for `timestamp level source message` lines and
+//! [`JsonLineLogParser`] for one-JSON-object-per-line files. Auto-detection
+//! (`parse_file_auto`) inspects the file extension or the first non-empty line
+//! to choose the right parser at runtime.
+
+/// Module identifier used for diagnostics and internal logging.
 pub const MODULE_NAME: &str = "parser";
 
 use crate::model::{LogEntry, LogLevel, LogSource, LogTimestamp};
@@ -9,6 +18,7 @@ use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+/// Result type for line-level parse operations.
 pub type ParseResult<T> = Result<T, ParseError>;
 
 /// Common interface for line-oriented log parsers.
@@ -67,6 +77,7 @@ pub fn parse_file_with(
 /// Parse a log file after detecting whether its first non-empty line is JSON.
 pub fn parse_file_auto(path: impl AsRef<Path>) -> Result<Vec<LogEntry>, ParseFileError> {
     let path = path.as_ref();
+    // Prefer JSON parsers when the file extension or first non-empty row says so.
     if should_parse_as_json(path)? {
         parse_file(path, &JsonLineLogParser)
     } else {
@@ -88,6 +99,7 @@ pub fn parse_file_auto_with(
 }
 
 fn should_parse_as_json(path: &Path) -> Result<bool, ParseFileError> {
+    // Fast path: well-known JSON extensions are always treated as JSON.
     if matches!(
         path.extension().and_then(|extension| extension.to_str()),
         Some("json" | "jsonl")
@@ -95,6 +107,7 @@ fn should_parse_as_json(path: &Path) -> Result<bool, ParseFileError> {
         return Ok(true);
     }
 
+    // Slow path: open the file and check whether the first non-empty line starts with '{'.
     let path = path.to_path_buf();
     let file = File::open(&path).map_err(|source| ParseFileError::Open {
         path: path.clone(),
@@ -157,6 +170,10 @@ impl LogParser for PlainTextLogParser {
     }
 }
 
+/// Attempt to parse a Spring Logback line (e.g. `HH:mm:ss.SSS [thread] LEVEL source - [caller] - msg`).
+///
+/// Returns `Ok(None)` when the line does not match the Logback shape so the
+/// caller can fall back to the generic plain-text parser.
 fn parse_spring_logback_line(line: &str) -> ParseResult<Option<LogEntry>> {
     let Some((time, rest)) = line.split_once(char::is_whitespace) else {
         return Ok(None);
@@ -172,6 +189,7 @@ fn parse_spring_logback_line(line: &str) -> ParseResult<Option<LogEntry>> {
     let Some(thread_end) = rest.find(']') else {
         return Err(ParseError::invalid_format(line));
     };
+    // Spring-style logs embed the thread and optional caller before the message body.
     let thread = &rest[1..thread_end];
     let after_thread = rest[thread_end + 1..].trim_start();
     let (level, after_level) = after_thread
@@ -206,6 +224,8 @@ fn parse_spring_logback_line(line: &str) -> ParseResult<Option<LogEntry>> {
     }))
 }
 
+/// Extract the optional `[caller]` bracket and the message body from a Logback
+/// line segment that appears after the logger name.
 fn parse_logback_caller_and_message(value: &str) -> (Option<&str>, &str) {
     let value = value.trim_start();
     if !value.starts_with('[') {
@@ -236,6 +256,7 @@ impl LogParser for JsonLineLogParser {
                 line: line.to_string(),
             })?;
 
+        // JSON inputs are normalized into the same LogEntry model as plain text rows.
         let timestamp = required_field(parsed.timestamp, "timestamp")?;
         let level = required_field(parsed.level, "level")?;
         let source = required_field(parsed.source, "source")?;
@@ -253,6 +274,8 @@ impl LogParser for JsonLineLogParser {
     }
 }
 
+/// JSON log line shape — all fields are optional so that missing-field errors
+/// are reported as [`ParseError::MissingField`] instead of deserialization failures.
 #[derive(Debug, Deserialize)]
 struct JsonLogLine {
     timestamp: Option<String>,
@@ -261,6 +284,7 @@ struct JsonLogLine {
     message: Option<String>,
 }
 
+/// Errors that can occur while parsing an individual log line.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ParseError {
     #[error("invalid log line format: {line}")]
@@ -275,6 +299,7 @@ pub enum ParseError {
     MissingField { field: &'static str },
 }
 
+/// Errors that can occur while reading or parsing a log file.
 #[derive(Debug, Error)]
 pub enum ParseFileError {
     #[error("failed to open log file {path}", path = .path.display())]
@@ -313,6 +338,7 @@ impl ParseError {
     }
 }
 
+/// Parse an RFC 3339 timestamp string into a UTC datetime.
 fn parse_timestamp(value: &str) -> ParseResult<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .map(|timestamp| timestamp.with_timezone(&Utc))
@@ -321,12 +347,14 @@ fn parse_timestamp(value: &str) -> ParseResult<DateTime<Utc>> {
         })
 }
 
+/// Normalize a level label (case-insensitive) into a [`LogLevel`].
 fn parse_level(value: &str) -> ParseResult<LogLevel> {
     LogLevel::from_label(value).ok_or_else(|| ParseError::InvalidLevel {
         value: value.to_string(),
     })
 }
 
+/// Ensure a required JSON field is present and non-empty.
 fn required_field(value: Option<String>, field: &'static str) -> ParseResult<String> {
     value
         .filter(|value| !value.trim().is_empty())
@@ -596,6 +624,7 @@ mod tests {
 
 /// Extract whitespace-delimited key=value tokens while preserving the message.
 fn extract_structured_fields(message: &str) -> BTreeMap<String, String> {
+    // Capture simple key=value tokens without parsing the whole message format.
     message
         .split_whitespace()
         .filter_map(|token| {

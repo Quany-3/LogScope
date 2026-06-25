@@ -1,3 +1,10 @@
+//! Interactive terminal interface powered by [ratatui] and [crossterm].
+//!
+//! The TUI displays a scrollable log list, a summary panel, a selected-entry
+//! detail view, and a report preview. Keyboard shortcuts allow filtering by
+//! level, searching by keyword, opening log files, and exporting HTML reports.
+
+/// Module identifier used for diagnostics and internal logging.
 pub const MODULE_NAME: &str = "tui";
 
 mod app;
@@ -24,10 +31,12 @@ pub fn run() -> Result<()> {
     run_app(App::default())
 }
 
+/// Start the TUI with pre-loaded log entries and a source label.
 pub fn run_with_entries(source_label: impl Into<String>, entries: Vec<LogEntry>) -> Result<()> {
     run_app(App::from_entries(source_label, entries)?)
 }
 
+/// Main event loop: poll for key/resize events, delegate to the app, and redraw.
 fn run_app(mut app: App) -> Result<()> {
     let (mut terminal, _guard) = setup_terminal()?;
     terminal.draw(|frame| render_app(frame, &app))?;
@@ -45,6 +54,7 @@ fn run_app(mut app: App) -> Result<()> {
                 }
             }
             Event::Resize(_, _) => {
+                // Resize events need a redraw so the layouts recalculate against the new area.
                 terminal.draw(|frame| render_app(frame, &app))?;
             }
             _ => {}
@@ -54,8 +64,11 @@ fn run_app(mut app: App) -> Result<()> {
     Ok(())
 }
 
+/// Type alias for the ratatui terminal backend used throughout the TUI.
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 
+/// Initialize raw mode and the alternate screen, returning a terminal and a
+/// guard that restores the original terminal state on drop.
 fn setup_terminal() -> Result<(TuiTerminal, TerminalGuard)> {
     enable_raw_mode().context("failed to enable terminal raw mode")?;
     // Create the guard before later setup steps so partial initialization is reversible.
@@ -68,6 +81,8 @@ fn setup_terminal() -> Result<(TuiTerminal, TerminalGuard)> {
     Ok((terminal, guard))
 }
 
+/// RAII guard that restores the terminal to its original state (disables raw
+/// mode, leaves the alternate screen, and re-shows the cursor) when dropped.
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
