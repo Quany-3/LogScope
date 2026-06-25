@@ -1,13 +1,17 @@
 use super::app::App;
 use crate::model::LogLevel;
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout};
+use ratatui::buffer::{Buffer, CellDiffOption};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
 pub(super) fn render_app(frame: &mut Frame<'_>, app: &App) {
+    // Clear the in-memory frame before drawing widgets; avoids CJK stale cells without terminal flicker.
+    frame.render_widget(Clear, frame.area());
+
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(1),
@@ -26,7 +30,7 @@ pub(super) fn render_app(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(
         Paragraph::new(truncate_text(
             &format!("LogScope - {}", app.source_label()),
-            header.width.saturating_sub(2) as usize,
+            content_width(header.width),
         ))
         .alignment(Alignment::Center)
         .style(Style::default().add_modifier(Modifier::BOLD))
@@ -36,9 +40,8 @@ pub(super) fn render_app(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(
         Paragraph::new(truncate_lines(
             styled_log_lines(app, logs.height.saturating_sub(2) as usize),
-            logs.width.saturating_sub(2) as usize,
+            content_width(logs.width),
         ))
-        .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .title(format!("Logs [{}]", app.filter_label()))
@@ -49,18 +52,16 @@ pub(super) fn render_app(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(
         Paragraph::new(truncate_lines(
             styled_summary_lines(app),
-            summary.width.saturating_sub(2) as usize,
+            content_width(summary.width),
         ))
-        .wrap(Wrap { trim: false })
         .block(Block::default().title("Summary").borders(Borders::ALL)),
         summary,
     );
     frame.render_widget(
         Paragraph::new(truncate_lines(
             styled_selected_entry_details(app),
-            detail.width.saturating_sub(2) as usize,
+            content_width(detail.width),
         ))
-        .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .title("Selected Entry")
@@ -76,9 +77,8 @@ pub(super) fn render_app(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(
         Paragraph::new(truncate_lines(
             styled_preview_lines(preview_lines),
-            preview.width.saturating_sub(2) as usize,
+            content_width(preview.width),
         ))
-        .wrap(Wrap { trim: false })
         .block(Block::default().title(preview_title).borders(Borders::ALL)),
         preview,
     );
@@ -94,12 +94,15 @@ pub(super) fn render_app(frame: &mut Frame<'_>, app: &App) {
                     Style::default().fg(Color::Gray),
                 )),
             ],
-            footer.width.saturating_sub(2) as usize,
+            content_width(footer.width),
         ))
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL)),
         footer,
     );
+
+    let frame_area = frame.area();
+    force_update_area(frame.buffer_mut(), frame_area);
 }
 
 fn styled_log_lines(app: &App, max_rows: usize) -> Vec<Line<'static>> {
@@ -302,6 +305,11 @@ fn level_style(level: LogLevel) -> Style {
     }
 }
 
+fn content_width(area_width: u16) -> usize {
+    // Extra safety columns avoid CJK wide glyphs touching block borders.
+    area_width.saturating_sub(4) as usize
+}
+
 fn truncate_lines(lines: Vec<Line<'static>>, max_width: usize) -> Vec<Line<'static>> {
     lines
         .into_iter()
@@ -352,18 +360,33 @@ fn display_width(value: &str) -> usize {
         .sum()
 }
 
+fn force_update_area(buffer: &mut Buffer, area: Rect) {
+    let area = area.intersection(*buffer.area());
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        display_width, level_style, render_app, styled_detail_line, styled_preview_line,
-        summary_style, truncate_line,
+        content_width, display_width, force_update_area, level_style, render_app,
+        styled_detail_line, styled_preview_line, summary_style, truncate_line,
     };
-    use crate::model::LogLevel;
+    use crate::model::{LogEntry, LogLevel, LogSource, LogTimestamp};
     use crate::tui::app::App;
+    use chrono::{TimeZone, Utc};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::{Buffer, CellDiffOption};
+    use ratatui::layout::Rect;
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
+    use std::collections::BTreeMap;
 
     #[test]
     fn styles_log_levels_by_urgency() {
@@ -435,6 +458,51 @@ mod tests {
 
         assert!(display_width(&rendered) <= 30);
         assert!(rendered.is_char_boundary(rendered.len()));
+    }
+
+    #[test]
+    fn renders_chinese_log_lines_without_crossing_panel_border() {
+        let backend = TestBackend::new(100, 26);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::from_entries(
+            "sys-info.log",
+            vec![LogEntry {
+                timestamp: LogTimestamp::new(
+                    Utc.with_ymd_and_hms(2026, 6, 24, 16, 30, 17).unwrap(),
+                ),
+                level: LogLevel::Info,
+                source: LogSource::new("sys-user"),
+                message: "[10.10.10.1]内网IP[admin][Error][用户不存在/密码错误]".repeat(3),
+                fields: BTreeMap::new(),
+                raw: String::new(),
+            }],
+        )
+        .unwrap();
+
+        terminal.draw(|frame| render_app(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let logs_right_border_x = 61;
+        for y in 4..21 {
+            assert_eq!(buffer[(logs_right_border_x, y)].symbol(), "│");
+        }
+    }
+
+    #[test]
+    fn reserves_a_safety_column_inside_bordered_blocks() {
+        assert_eq!(content_width(10), 6);
+        assert_eq!(content_width(2), 0);
+    }
+
+    #[test]
+    fn marks_rendered_cells_for_forced_diff_updates() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 2));
+
+        force_update_area(&mut buffer, Rect::new(1, 0, 2, 2));
+
+        assert_eq!(buffer[(1, 0)].diff_option, CellDiffOption::AlwaysUpdate);
+        assert_eq!(buffer[(2, 1)].diff_option, CellDiffOption::AlwaysUpdate);
+        assert_eq!(buffer[(0, 0)].diff_option, CellDiffOption::None);
     }
 
     #[test]

@@ -30,15 +30,24 @@ pub fn run_with_entries(source_label: impl Into<String>, entries: Vec<LogEntry>)
 
 fn run_app(mut app: App) -> Result<()> {
     let (mut terminal, _guard) = setup_terminal()?;
+    terminal.draw(|frame| render_app(frame, &app))?;
 
     while app.is_running() {
-        terminal.draw(|frame| render_app(frame, &app))?;
+        if !event::poll(Duration::from_millis(250))? {
+            continue;
+        }
 
-        if event::poll(Duration::from_millis(250))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            app.handle_key_event(key);
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                app.handle_key_event(key);
+                if app.is_running() {
+                    terminal.draw(|frame| render_app(frame, &app))?;
+                }
+            }
+            Event::Resize(_, _) => {
+                terminal.draw(|frame| render_app(frame, &app))?;
+            }
+            _ => {}
         }
     }
 

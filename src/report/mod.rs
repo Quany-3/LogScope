@@ -121,7 +121,7 @@ mod tests {
         assert!(output.starts_with("# Daily LogScope Report"));
         assert!(output.contains("Total entries: 3"));
         assert!(output.contains("- INFO: 2"));
-        assert!(output.contains("- api: 2"));
+        assert!(output.contains("- c.a.d.p.DruidAbstractDataSource: 2"));
         assert!(output.contains("## Notes\nGenerated from sample logs."));
     }
 
@@ -146,6 +146,10 @@ mod tests {
         assert!(output.contains("class=\"metric\""));
         assert!(output.contains("Level Distribution"));
         assert!(output.contains("Source Distribution"));
+        assert!(output.contains("class=\"donut-card\""));
+        assert!(output.contains("conic-gradient("));
+        assert!(output.contains("class=\"bar-label\""));
+        assert!(output.contains("title=\"c.a.d.p.DruidAbstractDataSource\""));
         assert!(output.contains("Notes"));
     }
 
@@ -257,7 +261,9 @@ mod tests {
         let mut summary = AnalysisResult::new(3);
         summary.level_counts.insert(LogLevel::Info, 2);
         summary.level_counts.insert(LogLevel::Error, 1);
-        summary.source_counts.insert("api".to_string(), 2);
+        summary
+            .source_counts
+            .insert("c.a.d.p.DruidAbstractDataSource".to_string(), 2);
         summary.source_counts.insert("worker".to_string(), 1);
 
         Report {
