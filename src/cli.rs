@@ -9,9 +9,10 @@ pub const MODULE_NAME: &str = "cli";
 
 use crate::analyzer::{AnalysisResult, BasicAnalyzer, SourceRanking};
 use crate::config::{LogScopeConfig, ParserFormat};
+use crate::filter::filter_entries;
 use crate::model::{
     ErrorPattern, FilterCondition, LogEntry, LogLevel, LogTimestamp, ReportExportFormat,
-    ReportMetadata, SearchResult,
+    ReportMetadata,
 };
 use crate::parser::{JsonLineLogParser, PlainTextLogParser, parse_file_auto_with, parse_file_with};
 use crate::report::{
@@ -191,35 +192,7 @@ fn execute_search(args: &SearchArgs) -> Result<Vec<LogEntry>> {
         start_time: args.start.map(LogTimestamp::new),
         end_time: args.end.map(LogTimestamp::new),
     };
-    let analyzer = BasicAnalyzer;
-    let mut matches = entries.iter().collect::<Vec<_>>();
-
-    // Intersect each filter against the current match set so all criteria compose.
-    if let Some(keyword) = condition.keyword.as_deref() {
-        retain_allowed(&mut matches, analyzer.search_keyword(&entries, keyword));
-    }
-    if let Some(level) = condition.level {
-        retain_allowed(&mut matches, analyzer.filter_by_level(&entries, level));
-    }
-    if let Some(source) = condition.source.as_deref() {
-        retain_allowed(&mut matches, analyzer.filter_by_source(&entries, source));
-    }
-    if condition.start_time.is_some() || condition.end_time.is_some() {
-        let start = condition
-            .start_time
-            .map(|timestamp| timestamp.value)
-            .unwrap_or(DateTime::<Utc>::MIN_UTC);
-        let end = condition
-            .end_time
-            .map(|timestamp| timestamp.value)
-            .unwrap_or(DateTime::<Utc>::MAX_UTC);
-        retain_allowed(
-            &mut matches,
-            analyzer.filter_by_time_range(&entries, start, end),
-        );
-    }
-
-    let result = SearchResult::new(matches);
+    let result = filter_entries(&entries, &condition);
     Ok(result.entries.into_iter().cloned().collect())
 }
 
@@ -434,11 +407,6 @@ fn resolve_options(
         .unwrap_or(ParserKind::Auto);
 
     Ok(RuntimeOptions { inputs, parser })
-}
-
-fn retain_allowed<'a>(current: &mut Vec<&'a LogEntry>, allowed: Vec<&'a LogEntry>) {
-    // Keep the original ordering while applying the next filter stage.
-    current.retain(|entry| allowed.contains(entry));
 }
 
 fn parse_log_level(value: &str) -> std::result::Result<LogLevel, String> {
