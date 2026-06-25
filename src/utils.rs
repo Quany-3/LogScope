@@ -1,3 +1,6 @@
+//! Small I/O utilities shared across CLI, TUI, and report modules.
+
+/// Module identifier used for diagnostics and internal logging.
 pub const MODULE_NAME: &str = "utils";
 
 use anyhow::{Context, Result};
@@ -15,6 +18,8 @@ pub fn write_file_safely(path: impl AsRef<Path>, content: &str) -> Result<()> {
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
 
+    // Atomic write: write to a hidden temp file first, then rename over the target.
+    // This avoids leaving a partial file if the process crashes mid-write.
     let file_name = path
         .file_name()
         .context("output path must include a file name")?
